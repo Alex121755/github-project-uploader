@@ -1052,6 +1052,37 @@ class UploaderCoreTests(unittest.TestCase):
             with self.assertRaisesRegex(core.UploadError, "已经使用"):
                 core.execute_upload(second["plan_id"])
 
+    def test_expired_plan_is_rejected_without_consuming_it(self) -> None:
+        (self.project / "README.md").write_text("safe\n", encoding="utf-8")
+        project = self.register()
+        plan = self.preflight(project["id"])
+        plans = core._load_plans()
+        plans["plans"][plan["plan_id"]]["expires_at"] = 0
+        core._write_json(core.PLANS_PATH, plans)
+
+        with self.assertRaisesRegex(core.UploadError, "已过期"):
+            core.execute_upload(plan["plan_id"])
+        self.assertFalse(core._load_plans()["plans"][plan["plan_id"]]["used"])
+
+    def test_public_plan_requires_exact_owner_repository_confirmation(self) -> None:
+        (self.project / "README.md").write_text("safe\n", encoding="utf-8")
+        project = self.register()
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=None
+        ):
+            plan = core.preflight_upload(project["id"], "safe-project", "public")
+        self.assertTrue(plan["ready"])
+
+        with self.assertRaisesRegex(core.UploadError, "完整仓库名"):
+            core.execute_upload(plan["plan_id"], "ExampleUser/wrong-project")
+        self.assertFalse(core._load_plans()["plans"][plan["plan_id"]]["used"])
+
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=None
+        ), mock.patch.dict(os.environ, {"UPLOAD_DRY_RUN": "1"}):
+            result = core.execute_upload(plan["plan_id"], "ExampleUser/safe-project")
+        self.assertTrue(result["dry_run"])
+
     def test_fingerprint_detects_same_size_change_with_restored_mtime(self) -> None:
         readme = self.project / "README.md"
         readme.write_text("alpha\n", encoding="utf-8")

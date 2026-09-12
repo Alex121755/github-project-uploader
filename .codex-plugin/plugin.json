@@ -1,6 +1,6 @@
 {
   "name": "github-project-uploader",
-  "version": "0.1.0+codex.20260912040053",
+  "version": "0.1.1+codex.20260912102655",
   "description": "Choose a local project in Codex, run fail-closed checks for likely secrets and Git hazards, then push one exact commit to GitHub after explicit confirmation.",
   "author": {
     "name": "ALEX",

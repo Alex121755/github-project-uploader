@@ -21,12 +21,12 @@ import uploader_core  # noqa: E402
 
 SERVER_NAME = "github-project-uploader"
 SERVER_TITLE = "GitHub 项目上传器"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.1.1"
 SERVER_DESCRIPTION = "选择已注册的本地项目，安全预检后上传到当前登录的 GitHub 账号。"
 SERVER_INSTRUCTIONS = (
-    "默认只创建私有仓库。先调用 render_upload_picker 展示可点击列表，"
-    "或先 register_project 添加一个明确的项目根目录。任何上传都必须先 preflight_upload，"
-    "然后由用户明确确认具体仓库与可见性后才能调用 execute_upload。绝不显示检测到的密钥内容。"
+    "默认私有。选择时只调用 render_upload_picker；指定已注册项目时最多 list_projects 一次；"
+    "新根目录用 register_project。随后必须 preflight_upload，并在确认完整目标和可见性后才可"
+    "execute_upload；绝不返回检测到的密钥值。"
 )
 
 HANDSHAKE_PROTOCOL_VERSIONS = frozenset(
@@ -183,7 +183,9 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     try:
         if name == "list_projects":
             payload = {"ok": True, **uploader_core.list_projects()}
-            return _text_result(payload, json.dumps(payload, ensure_ascii=False))
+            auth = payload.get("github", {})
+            account = auth.get("owner") if auth.get("connected") else "未连接"
+            return _text_result(payload, f"已加载 {len(payload['projects'])} 个项目；GitHub：{account}。")
         if name == "render_upload_picker":
             payload = {"ok": True, "view": "projects", **uploader_core.list_projects()}
             return _text_result(
@@ -209,8 +211,15 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                     _optional_string(arguments, "visibility", "private"),
                 ),
             }
-            message = "上传预检通过，等待用户确认。" if payload["ready"] else "上传预检发现阻止项，尚未上传。"
-            return _text_result(payload, message + "\n" + json.dumps(payload, ensure_ascii=False))
+            repository = payload["repository"]
+            visibility_label = "公开" if repository["visibility"] == "public" else "私有"
+            status = "通过，等待确认" if payload["ready"] else "未通过，尚未上传"
+            message = (
+                f"预检{status}：{repository['name_with_owner']}（{visibility_label}）；"
+                f"{payload['files']['count']} 个文件，阻止 {payload['blocking_issue_count']}，"
+                f"警告 {payload['warning_count']}。"
+            )
+            return _text_result(payload, message)
         if name == "execute_upload":
             payload = {
                 "ok": True,

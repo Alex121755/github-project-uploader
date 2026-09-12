@@ -6,6 +6,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +16,43 @@ import server  # noqa: E402
 
 
 class ServerContractTests(unittest.TestCase):
+    def test_tool_text_summaries_do_not_duplicate_structured_payloads(self) -> None:
+        listed_payload = {
+            "projects": [{"id": "p1", "name": "Example", "path": "/private/example"}],
+            "github": {"connected": True, "owner": "octocat"},
+            "default_visibility": "private",
+        }
+        with mock.patch.object(server.uploader_core, "list_projects", return_value=listed_payload):
+            listed = server._call_tool("list_projects", {})
+        listed_text = listed["content"][0]["text"]
+        self.assertNotIn("/private/example", listed_text)
+        self.assertLess(len(listed_text.encode()), len(json.dumps(listed["structuredContent"]).encode()) // 2)
+
+        preflight_payload = {
+            "plan_id": "plan",
+            "ready": True,
+            "repository": {
+                "name_with_owner": "octocat/example",
+                "visibility": "public",
+            },
+            "files": {"count": 12},
+            "blocking_issue_count": 0,
+            "warning_count": 1,
+            "issues": [{"severity": "warn", "code": "public_repository", "path": "/private/example"}],
+        }
+        with mock.patch.object(server.uploader_core, "preflight_upload", return_value=preflight_payload):
+            preflight = server._call_tool(
+                "preflight_upload",
+                {"project_id": "p1", "repo_name": "example", "visibility": "public"},
+            )
+        preflight_text = preflight["content"][0]["text"]
+        self.assertIn("octocat/example", preflight_text)
+        self.assertNotIn("/private/example", preflight_text)
+        self.assertLess(
+            len(preflight_text.encode()),
+            len(json.dumps(preflight["structuredContent"]).encode()) // 2,
+        )
+
     def test_initialize_negotiates_only_supported_handshake_versions(self) -> None:
         for version in server.HANDSHAKE_PROTOCOL_VERSIONS:
             with self.subTest(version=version):
