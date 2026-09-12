@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: var(--color-background-primary, #ffffff);
+      --soft: var(--color-background-secondary, #f6f8fa);
+      --text: var(--color-text-primary, #1f2328);
+      --muted: var(--color-text-secondary, #636c76);
+      --line: var(--color-border-light, #d0d7de);
+      --brand: #238636;
+      --brand-hover: #1f7a31;
+      --danger: #cf222e;
+      --danger-soft: rgba(207, 34, 46, 0.09);
+      --warn: #9a6700;
+      --warn-soft: rgba(191, 135, 0, 0.12);
+      --ok-soft: rgba(35, 134, 54, 0.10);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); }
+    main { padding: 16px; max-width: 760px; margin: 0 auto; }
+    header { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+    h1 { font-size: 18px; line-height: 1.3; margin: 0; letter-spacing: -0.01em; }
+    .sub { color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .account { border: 1px solid var(--line); border-radius: 999px; padding: 5px 9px; font-size: 12px; white-space: nowrap; }
+    .account.ok { border-color: rgba(35, 134, 54, .35); background: var(--ok-soft); color: #1a7f37; }
+    .notice { border: 1px solid var(--line); background: var(--soft); border-radius: 10px; padding: 10px 12px; font-size: 13px; margin: 10px 0; }
+    .notice.error { border-color: rgba(207, 34, 46, .35); background: var(--danger-soft); color: var(--danger); }
+    .toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; margin: 12px 0; }
+    input, button { font: inherit; }
+    input[type="text"] { width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--bg); outline: none; }
+    input[type="text"]:focus { border-color: #0969da; box-shadow: 0 0 0 2px rgba(9, 105, 218, .15); }
+    button { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; background: var(--bg); color: var(--text); cursor: pointer; font-weight: 600; }
+    button:hover:not(:disabled) { background: var(--soft); }
+    button.primary { background: var(--brand); color: #fff; border-color: var(--brand); }
+    button.primary:hover:not(:disabled) { background: var(--brand-hover); }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .projects { display: grid; gap: 8px; max-height: 308px; overflow: auto; padding: 1px; }
+    .project { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 8px; padding: 11px; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; background: var(--bg); }
+    .project:hover { background: var(--soft); }
+    .project.selected { border-color: #0969da; box-shadow: 0 0 0 1px #0969da; }
+    .project input { margin-top: 3px; }
+    .project-name { font-weight: 650; font-size: 14px; }
+    .path { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
+    .meta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 7px; }
+    .tag { font-size: 11px; border: 1px solid var(--line); border-radius: 999px; padding: 2px 7px; color: var(--muted); }
+    .tag.private { color: #8250df; border-color: rgba(130, 80, 223, .35); }
+    section { margin-top: 14px; }
+    .repo-row { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 0; }
+    .owner { border: 1px solid var(--line); border-right: 0; border-radius: 8px 0 0 8px; background: var(--soft); padding: 9px 10px; color: var(--muted); font-size: 13px; }
+    .repo-row input { border-radius: 0 8px 8px 0; }
+    .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+    details { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+    summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+    .add-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(120px, 1fr) auto; gap: 8px; margin-top: 9px; }
+    .summary-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: var(--soft); }
+    .summary-title { font-weight: 700; font-size: 15px; }
+    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
+    .stat { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+    .stat strong { display: block; font-size: 15px; }
+    .stat span { color: var(--muted); font-size: 11px; }
+    .issues { display: grid; gap: 6px; margin-top: 10px; }
+    .issue { border-radius: 8px; padding: 8px 10px; font-size: 12px; }
+    .issue.block { color: var(--danger); background: var(--danger-soft); }
+    .issue.warn { color: var(--warn); background: var(--warn-soft); }
+    .issue-path { display: block; opacity: .82; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: 3px; overflow-wrap: anywhere; }
+    .spinner { display: inline-block; width: 13px; height: 13px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -2px; margin-right: 6px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .complete { text-align: center; padding: 20px 8px; }
+    .complete .check { width: 44px; height: 44px; margin: 0 auto 10px; display: grid; place-items: center; border-radius: 50%; background: var(--ok-soft); color: #1a7f37; font-size: 24px; }
+    .complete a { color: #0969da; overflow-wrap: anywhere; }
+    .hidden { display: none !important; }
+    @media (max-width: 560px) {
+      .add-grid { grid-template-columns: 1fr; }
+      .stats { grid-template-columns: 1fr; }
+      header { align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>GitHub 项目上传器</h1>
+        <div class="sub">选择项目，预检后上传为私有仓库</div>
+      </div>
+      <div id="account" class="account">正在连接…</div>
+    </header>
+
+    <div id="notice" class="notice hidden" role="status"></div>
+
+    <div id="projectView">
+      <div id="projects" class="projects"></div>
+      <section>
+        <label class="sub" for="repoName">GitHub 仓库名</label>
+        <div class="repo-row">
+          <span id="owner" class="owner">GitHub/</span>
+          <input id="repoName" type="text" maxlength="100" autocomplete="off" placeholder="my-project" />
+        </div>
+        <div class="meta"><span class="tag private">默认私有</span><span class="tag">不会强制推送</span></div>
+        <div class="actions">
+          <button id="refreshButton" type="button">刷新</button>
+          <button id="preflightButton" type="button" class="primary" disabled>检查并准备上传</button>
+        </div>
+      </section>
+
+      <details>
+        <summary>添加新的本地项目</summary>
+        <div class="add-grid">
+          <input id="projectPath" type="text" placeholder="/完整/项目/路径" />
+          <input id="displayName" type="text" placeholder="显示名称（可选）" />
+          <button id="addButton" type="button">添加</button>
+        </div>
+        <div class="sub" style="margin-top:7px">请选择具体项目根目录，不要填写整个“文稿”或用户主目录。</div>
+      </details>
+    </div>
+
+    <div id="preflightView" class="hidden"></div>
+    <div id="completeView" class="hidden"></div>
+  </main>
+
+  <script>
+    (() => {
+      const state = { data: null, selectedId: null, plan: null, busy: false };
+      const pending = new Map();
+      let nextRequestId = 1;
+
+      const el = (id) => document.getElementById(id);
+      const projectView = el("projectView");
+      const preflightView = el("preflightView");
+      const completeView = el("completeView");
+
+      function post(message) {
+        window.parent.postMessage(message, "*");
+      }
+
+      function notify(method, params) {
+        const message = { jsonrpc: "2.0", method };
+        if (params !== undefined) message.params = params;
+        post(message);
+      }
+
+      function request(method, params, timeoutMs = 120000) {
+        const id = nextRequestId++;
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            pending.delete(id);
+            reject(new Error("Codex 没有响应，请在对话中重试。"));
+          }, timeoutMs);
+          pending.set(id, {
+            resolve: (value) => { clearTimeout(timer); resolve(value); },
+            reject: (error) => { clearTimeout(timer); reject(error); },
+          });
+          post({ jsonrpc: "2.0", id, method, params });
+        });
+      }
+
+      async function callTool(name, args, timeoutMs) {
+        const result = await request("tools/call", { name, arguments: args || {} }, timeoutMs);
+        if (result?.isError) {
+          const text = result.content?.find((item) => item.type === "text")?.text;
+          throw new Error(text || "操作失败");
+        }
+        return result?.structuredContent || result;
+      }
+
+      function showNotice(message, kind = "info") {
+        const notice = el("notice");
+        notice.textContent = message || "";
+        notice.className = message ? `notice ${kind === "error" ? "error" : ""}` : "notice hidden";
+      }
+
+      function setBusy(value, label) {
+        state.busy = value;
+        [el("refreshButton"), el("preflightButton"), el("addButton")].forEach((button) => {
+          if (button) button.disabled = value || (button.id === "preflightButton" && !state.selectedId);
+        });
+        if (label) showNotice(label);
+      }
+
+      function formatBytes(bytes) {
+        const value = Number(bytes || 0);
+        if (value < 1024) return `${value} B`;
+        if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`;
+        if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`;
+        return `${(value / 1024 ** 3).toFixed(2)} GB`;
+      }
+
+      function textNode(tag, className, text) {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        node.textContent = text;
+        return node;
+      }
+
+      function renderProjects(data) {
+        state.data = data;
+        state.plan = null;
+        projectView.classList.remove("hidden");
+        preflightView.classList.add("hidden");
+        completeView.classList.add("hidden");
+
+        const github = data?.github || {};
+        el("account").textContent = github.connected ? `● ${github.owner}` : "GitHub 未连接";
+        el("account").className = `account ${github.connected ? "ok" : ""}`;
+        el("owner").textContent = `${github.owner || "GitHub"}/`;
+
+        const container = el("projects");
+        container.replaceChildren();
+        const projects = Array.isArray(data?.projects) ? data.projects : [];
+        if (!projects.length) {
+          container.append(textNode("div", "notice", "还没有项目。展开下方“添加新的本地项目”，填写项目路径。"));
+          state.selectedId = null;
+          el("preflightButton").disabled = true;
+          return;
+        }
+        if (!projects.some((project) => project.id === state.selectedId && project.exists)) {
+          state.selectedId = null;
+        }
+        for (const project of projects) {
+          const card = document.createElement("label");
+          card.className = `project ${project.id === state.selectedId ? "selected" : ""}`;
+          const radio = document.createElement("input");
+          radio.type = "radio";
+          radio.name = "project";
+          radio.value = project.id;
+          radio.checked = project.id === state.selectedId;
+          radio.disabled = !project.exists || project.inside_larger_repository;
+          const body = document.createElement("div");
+          body.append(textNode("div", "project-name", project.name || "未命名项目"));
+          body.append(textNode("div", "path", project.path || ""));
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.append(textNode("span", "tag", project.is_git_repository ? `Git · ${project.branch || "无分支"}` : "将初始化 Git"));
+          if (project.origin) meta.append(textNode("span", "tag", "已有 origin"));
+          if (!project.exists) meta.append(textNode("span", "tag", "路径不存在"));
+          if (project.inside_larger_repository) meta.append(textNode("span", "tag", "请选择仓库根目录"));
+          body.append(meta);
+          card.append(radio, body);
+          card.addEventListener("change", () => {
+            state.selectedId = project.id;
+            el("repoName").value = project.suggested_repo_name || "project";
+            renderProjects(state.data);
+            showNotice("");
+          });
+          container.append(card);
+        }
+        el("preflightButton").disabled = state.busy || !state.selectedId || !github.connected;
+      }
+
+      function addStat(parent, value, label) {
+        const node = document.createElement("div");
+        node.className = "stat";
+        node.append(textNode("strong", "", value), textNode("span", "", label));
+        parent.append(node);
+      }
+
+      function renderPreflight(plan) {
+        state.plan = plan;
+        projectView.classList.add("hidden");
+        completeView.classList.add("hidden");
+        preflightView.classList.remove("hidden");
+        preflightView.replaceChildren();
+
+        const card = document.createElement("div");
+        card.className = "summary-card";
+        card.append(textNode("div", "summary-title", plan.repository?.name_with_owner || "上传计划"));
+        card.append(textNode("div", "sub", `${plan.project?.name || "项目"} · ${plan.repository?.visibility === "private" ? "私有仓库" : "公开仓库"}`));
+        const stats = document.createElement("div");
+        stats.className = "stats";
+        addStat(stats, String(plan.files?.count ?? 0), "文件");
+        addStat(stats, formatBytes(plan.files?.total_bytes), "当前内容");
+        addStat(stats, String(plan.warning_count ?? 0), "警告");
+        card.append(stats);
+
+        const issues = document.createElement("div");
+        issues.className = "issues";
+        const issueList = Array.isArray(plan.issues) ? plan.issues : [];
+        if (!issueList.length) {
+          issues.append(textNode("div", "notice", "预检未发现敏感凭据、超大文件或远程仓库冲突。"));
+        }
+        for (const issue of issueList) {
+          const row = textNode("div", `issue ${issue.severity}`, `${issue.severity === "block" ? "阻止" : "注意"}：${issue.message}`);
+          if (issue.path) row.append(textNode("span", "issue-path", `${issue.path}${issue.line ? `:${issue.line}` : ""}`));
+          issues.append(row);
+        }
+        card.append(issues);
+        preflightView.append(card);
+
+        const actions = document.createElement("div");
+        actions.className = "actions";
+        const back = textNode("button", "", "返回项目列表");
+        back.type = "button";
+        back.onclick = () => { showNotice(""); renderProjects(state.data); };
+        actions.append(back);
+        if (plan.ready && plan.repository?.visibility === "private") {
+          const upload = textNode("button", "primary", plan.confirmation_label || "确认上传");
+          upload.type = "button";
+          upload.onclick = async () => {
+            upload.disabled = true;
+            upload.innerHTML = '<span class="spinner"></span>正在上传…';
+            try {
+              const result = await callTool("execute_upload", { plan_id: plan.plan_id }, 1850000);
+              if (!result?.ok) throw new Error(result?.error || "上传失败");
+              renderComplete(result);
+            } catch (error) {
+              showNotice(error?.message || String(error), "error");
+              upload.disabled = false;
+              upload.textContent = plan.confirmation_label || "确认上传";
+            }
+          };
+          actions.append(upload);
+        } else if (plan.ready) {
+          const target = plan.repository?.name_with_owner || "owner/repo";
+          const publicNotice = textNode(
+            "div",
+            "notice",
+            `公开仓库不会从卡片直接执行。请回到对话并输入完整确认：确认公开上传 ${target}`,
+          );
+          publicNotice.style.width = "100%";
+          preflightView.append(publicNotice);
+        }
+        preflightView.append(actions);
+      }
+
+      function renderComplete(result) {
+        projectView.classList.add("hidden");
+        preflightView.classList.add("hidden");
+        completeView.classList.remove("hidden");
+        completeView.replaceChildren();
+        const box = document.createElement("div");
+        box.className = "complete";
+        const isDryRun = result?.dry_run === true || result?.uploaded === false;
+        box.append(textNode("div", "check", isDryRun ? "i" : "✓"));
+        box.append(textNode("div", "summary-title", isDryRun ? "测试模式完成，未上传" : "项目已上传"));
+        box.append(textNode(
+          "div",
+          "sub",
+          isDryRun ? "已验证执行流程，但没有创建仓库或推送项目。" : (result.repository || "GitHub"),
+        ));
+        if (!isDryRun && result.repository_url) {
+          const link = document.createElement("a");
+          link.href = result.repository_url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.textContent = result.repository_url;
+          link.addEventListener("click", async (event) => {
+            event.preventDefault();
+            try {
+              const response = await request("ui/open-link", { url: result.repository_url });
+              if (response?.isError) throw new Error("Codex 未允许打开该 GitHub 链接。");
+            } catch (error) {
+              showNotice(error?.message || String(error), "error");
+            }
+          });
+          box.append(document.createElement("br"), link);
+        }
+        const again = textNode("button", "", "继续上传其他项目");
+        again.type = "button";
+        again.style.marginTop = "14px";
+        again.onclick = refresh;
+        box.append(document.createElement("br"), again);
+        completeView.append(box);
+        showNotice("");
+      }
+
+      async function refresh() {
+        setBusy(true, "正在刷新项目列表…");
+        try {
+          const data = await callTool("list_projects", {});
+          if (!data?.ok) throw new Error(data?.error || "无法读取项目列表");
+          renderProjects(data);
+          showNotice("");
+        } catch (error) {
+          showNotice(error?.message || String(error), "error");
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      el("refreshButton").onclick = refresh;
+      el("preflightButton").onclick = async () => {
+        const repoName = el("repoName").value.trim();
+        if (!state.selectedId || !repoName) {
+          showNotice("请选择项目并填写仓库名。", "error");
+          return;
+        }
+        setBusy(true, "正在检查敏感文件、Git 历史与仓库冲突…");
+        try {
+          const plan = await callTool("preflight_upload", {
+            project_id: state.selectedId,
+            repo_name: repoName,
+            visibility: "private",
+          });
+          if (!plan?.ok) throw new Error(plan?.error || "预检失败");
+          showNotice("");
+          renderPreflight(plan);
+        } catch (error) {
+          showNotice(error?.message || String(error), "error");
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      el("addButton").onclick = async () => {
+        const path = el("projectPath").value.trim();
+        const displayName = el("displayName").value.trim();
+        if (!path) {
+          showNotice("请填写项目的完整路径。", "error");
+          return;
+        }
+        setBusy(true, "正在添加项目…");
+        try {
+          const result = await callTool("register_project", { path, display_name: displayName });
+          if (!result?.ok) throw new Error(result?.error || "添加失败");
+          state.selectedId = result.project?.id || null;
+          el("projectPath").value = "";
+          el("displayName").value = "";
+          await refresh();
+        } catch (error) {
+          showNotice(error?.message || String(error), "error");
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      window.addEventListener("message", (event) => {
+        if (event.source !== window.parent) return;
+        const message = event.data;
+        if (!message || message.jsonrpc !== "2.0") return;
+        if (message.id !== undefined && (message.result !== undefined || message.error !== undefined) && pending.has(message.id)) {
+          const handler = pending.get(message.id);
+          pending.delete(message.id);
+          if (message.error) handler.reject(new Error(message.error.message || "操作失败"));
+          else handler.resolve(message.result);
+          return;
+        }
+        if (message.method === "ui/notifications/tool-result") {
+          const payload = message.params?.structuredContent;
+          if (payload?.view === "preflight") renderPreflight(payload);
+          else if (payload?.view === "complete") renderComplete(payload);
+          else if (payload?.projects) renderProjects(payload);
+        } else if (message.method === "ui/notifications/tool-cancelled") {
+          showNotice(message.params?.reason || "操作已取消。", "error");
+        } else if ((message.method === "ping" || message.method === "ui/resource-teardown") && message.id !== undefined) {
+          post({ jsonrpc: "2.0", id: message.id, result: {} });
+        }
+      }, { passive: true });
+
+      window.addEventListener("openai:set_globals", (event) => {
+        const payload = event.detail?.globals?.toolOutput;
+        if (payload?.projects) renderProjects(payload);
+      }, { passive: true });
+
+      const initial = window.openai?.toolOutput;
+      if (initial?.projects) {
+        renderProjects(initial);
+        showNotice("");
+      } else {
+        showNotice("正在读取项目列表…");
+      }
+
+      async function connectMcpApp() {
+        const initialized = await request("ui/initialize", {
+          appInfo: { name: "github-project-uploader", version: "0.1.0" },
+          appCapabilities: { availableDisplayModes: ["inline"] },
+          protocolVersion: "2026-01-26",
+        });
+        notify("ui/notifications/initialized");
+        if (!initialized?.hostCapabilities?.serverTools) {
+          throw new Error("当前 Codex 版本不支持在卡片内调用工具；仍可在对话中选择项目上传。");
+        }
+      }
+
+      void connectMcpApp().catch((error) => showNotice(error?.message || String(error), "error"));
+    })();
+  </script>
+</body>
+</html>

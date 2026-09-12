@@ -1,0 +1,32 @@
+# Python caches and test output
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local environments and regenerated dependencies
+.venv/
+venv/
+vendor/
+
+# Build and editor output
+build/
+dist/
+*.egg-info/
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+.netrc
+.git-credentials
+*.pem
+*.key
+*.p12
+*.pfx
+

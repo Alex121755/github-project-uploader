@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "github-project-uploader": {
+      "command": "python3",
+      "args": ["./scripts/server.py"],
+      "cwd": ".",
+      "env_vars": ["HOME", "PATH", "CODEX_HOME"],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      },
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 1800,
+      "default_tools_approval_mode": "approve",
+      "tools": {
+        "execute_upload": {
+          "approval_mode": "prompt"
+        }
+      }
+    }
+  }
+}

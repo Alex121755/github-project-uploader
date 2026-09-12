@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
+
+import server  # noqa: E402
+
+
+class ServerContractTests(unittest.TestCase):
+    def test_initialize_negotiates_only_supported_handshake_versions(self) -> None:
+        for version in server.HANDSHAKE_PROTOCOL_VERSIONS:
+            with self.subTest(version=version):
+                self.assertEqual(server._initialize({"protocolVersion": version})["protocolVersion"], version)
+        self.assertEqual(
+            server._initialize({"protocolVersion": "future-version"})["protocolVersion"],
+            server.LATEST_HANDSHAKE_PROTOCOL_VERSION,
+        )
+        self.assertEqual(
+            server._initialize({})["protocolVersion"],
+            server.LATEST_HANDSHAKE_PROTOCOL_VERSION,
+        )
+
+    def test_ui_resource_returns_raw_mcp_app_html(self) -> None:
+        html = server.uploader_ui()
+        self.assertIsInstance(html, str)
+        self.assertTrue(html.startswith("<!doctype html>"))
+        self.assertIn("ui/initialize", html)
+        self.assertIn('visibility: "private"', html)
+        self.assertIn("公开仓库不会从卡片直接执行", html)
+        self.assertIn("测试模式完成，未上传", html)
+        self.assertIn('callTool("execute_upload", { plan_id: plan.plan_id }, 1850000)', html)
+
+    def test_ui_resource_metadata_allows_github_link(self) -> None:
+        self.assertEqual(server.RESOURCE_MIME, "text/html;profile=mcp-app")
+        self.assertIn("https://github.com", server.RESOURCE_META["ui"]["csp"]["resourceDomains"])
+
+    def test_stdio_protocol_contract(self) -> None:
+        requests = [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "contract-test", "version": "1"},
+                },
+            },
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "resources/read",
+                "params": {"uri": server.RESOURCE_URI},
+            },
+        ]
+        payload = "".join(json.dumps(item) + "\n" for item in requests)
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        completed = subprocess.run(
+            [sys.executable, "scripts/server.py"],
+            cwd=PLUGIN_ROOT,
+            input=payload,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        responses = {item["id"]: item for item in map(json.loads, completed.stdout.splitlines())}
+        self.assertEqual(set(responses), {1, 2, 3})
+        self.assertEqual(responses[1]["result"]["serverInfo"]["name"], "github-project-uploader")
+        tools = responses[2]["result"]["tools"]
+        self.assertEqual(len(tools), 5)
+        execute = next(tool for tool in tools if tool["name"] == "execute_upload")
+        self.assertTrue(execute["annotations"]["destructiveHint"])
+        content = responses[3]["result"]["contents"][0]
+        self.assertEqual(content["mimeType"], server.RESOURCE_MIME)
+        self.assertTrue(content["text"].startswith("<!doctype html>"))
+
+    def test_public_release_tree_is_self_scannable(self) -> None:
+        files, symlinks, nested = server.uploader_core._new_repo_files(PLUGIN_ROOT)
+        self.assertFalse(symlinks)
+        self.assertFalse(nested)
+        self.assertFalse(any(path.startswith("vendor/") for path in files))
+        self.assertFalse(any("__pycache__/" in path or path.endswith(".pyc") for path in files))
+        issues = []
+        for relative in files:
+            path = PLUGIN_ROOT / relative
+            issues.extend(server.uploader_core._scan_bytes(path.read_bytes(), relative, "current"))
+        blockers = [issue for issue in issues if issue["severity"] == "block"]
+        self.assertEqual(blockers, [])
+
+    def test_repository_marketplace_and_portable_python_command(self) -> None:
+        mcp = json.loads((PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8"))
+        command = mcp["mcpServers"]["github-project-uploader"]["command"]
+        self.assertEqual(command, "python3")
+        marketplace = json.loads(
+            (PLUGIN_ROOT / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(marketplace["name"], "alex121755-tools")
+        entry = marketplace["plugins"][0]
+        self.assertEqual(entry["name"], "github-project-uploader")
+        self.assertEqual(entry["source"]["source"], "url")
+        self.assertTrue(entry["source"]["url"].endswith("/github-project-uploader.git"))
+
+
+if __name__ == "__main__":
+    unittest.main()

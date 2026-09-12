@@ -1,0 +1,22 @@
+{
+  "name": "alex121755-tools",
+  "interface": {
+    "displayName": "ALEX Tools"
+  },
+  "plugins": [
+    {
+      "name": "github-project-uploader",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/Alex121755/github-project-uploader.git",
+        "ref": "main"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Development"
+    }
+  ]
+}
+
