@@ -9,6 +9,7 @@ Contributions are welcome, especially focused tests and portability improvements
 - Never add force-push, mirror-push, automatic deletion, or silent `origin` replacement.
 - Keep all subprocess calls argument-array based with `shell=False`.
 - Treat project paths, Git metadata, command output, and remote URLs as untrusted data.
+- Preserve isolated-subdirectory containment: never inherit parent Git state and never write Git metadata into the selected directory or its parent.
 - Do not add live credentials or token-shaped literals to fixtures. Build synthetic values from separate string fragments at runtime.
 - Add a regression test for every security-sensitive change.
 
@@ -29,4 +30,3 @@ Tests must not create real GitHub repositories or push to the network. Mock remo
 - [ ] No credential, private path, generated cache, or vendored runtime entered the diff.
 - [ ] README/security documentation matches changed behavior.
 - [ ] Tool annotations and confirmation boundaries remain accurate.
-

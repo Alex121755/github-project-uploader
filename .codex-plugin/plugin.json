@@ -1,7 +1,7 @@
 {
   "name": "github-project-uploader",
-  "version": "0.1.1+codex.20260912102655",
-  "description": "Choose a local project in Codex, run fail-closed checks for likely secrets and Git hazards, then push one exact commit to GitHub after explicit confirmation.",
+  "version": "0.3.0+codex.20260926030451",
+  "description": "Choose a local project, self-check for exposed credentials, then preflight and upload an exact commit to GitHub after confirmation.",
   "author": {
     "name": "ALEX",
     "url": "https://github.com/Alex121755"
@@ -20,8 +20,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "GitHub Project Uploader",
-    "shortDescription": "Pick, preflight, and upload local projects to GitHub",
-    "longDescription": "Choose a registered local project from an interactive Codex card, run bounded heuristic checks for likely credentials, Git-state hazards, and oversized content, then create a new repository or push to an already-matching origin under the currently authenticated personal GitHub account. Repositories are private by default and every upload uses a short-lived, one-time confirmation plan.",
+    "shortDescription": "Pick projects, check secrets, and upload to GitHub",
+    "longDescription": "Choose a registered local project or a non-repository project directory inside a larger Git repository. Run a local self-check for likely API keys, tokens, credentials, and history findings without signing in to GitHub. For uploading, run a separate bounded preflight and push one exact commit under the currently authenticated personal GitHub account after explicit confirmation. Repositories are private by default.",
     "developerName": "ALEX",
     "category": "Development",
     "capabilities": [
@@ -34,6 +34,7 @@
     "websiteURL": "https://github.com/Alex121755/github-project-uploader",
     "defaultPrompt": [
       "\u9009\u62e9\u4e00\u4e2a\u9879\u76ee\u4e0a\u4f20\u5230 GitHub",
+      "\u68c0\u67e5\u8fd9\u4e2a\u9879\u76ee\u6709\u6ca1\u6709 API Key \u6216 Token \u6cc4\u6f0f",
       "\u628a\u5f53\u524d\u9879\u76ee\u52a0\u5165 GitHub \u4e0a\u4f20\u5217\u8868",
       "\u5bf9\u8fd9\u4e2a\u9879\u76ee\u6267\u884c GitHub \u4e0a\u4f20\u9884\u68c0"
     ]

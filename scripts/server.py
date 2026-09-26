@@ -21,11 +21,12 @@ import uploader_core  # noqa: E402
 
 SERVER_NAME = "github-project-uploader"
 SERVER_TITLE = "GitHub 项目上传器"
-SERVER_VERSION = "0.1.1"
-SERVER_DESCRIPTION = "选择已注册的本地项目，安全预检后上传到当前登录的 GitHub 账号。"
+SERVER_VERSION = "0.3.0"
+SERVER_DESCRIPTION = "选择本地项目，独立自检疑似凭据泄漏，安全预检后上传到当前登录的 GitHub 账号。"
 SERVER_INSTRUCTIONS = (
     "默认私有。选择时只调用 render_upload_picker；指定已注册项目时最多 list_projects 一次；"
-    "新根目录用 register_project。随后必须 preflight_upload，并在确认完整目标和可见性后才可"
+    "新项目目录用 register_project；单独检查凭据泄漏时调用 self_check_project，不需要 GitHub 登录或仓库名。"
+    "上传时仍必须 preflight_upload，并在确认完整目标和可见性后才可"
     "execute_upload；绝不返回检测到的密钥值。"
 )
 
@@ -81,11 +82,11 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "register_project",
         "title": "添加项目到上传列表",
-        "description": "注册一个明确的本地项目根目录，使它出现在项目上传器中。不要注册用户主目录或宽泛父目录。",
+        "description": "注册一个明确的本地项目目录，使它出现在上传器中。父 Git 仓库内的子目录会被隔离为独立快照；不要注册用户主目录或宽泛父目录。",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "项目根目录的绝对路径。"},
+                "path": {"type": "string", "description": "具体项目目录的绝对路径，可位于更大的 Git 仓库中。"},
                 "display_name": {"type": "string", "default": "", "description": "可选显示名称。"},
             },
             "required": ["path"],
@@ -97,6 +98,19 @@ TOOLS: list[dict[str, Any]] = [
             "idempotentHint": True,
             "openWorldHint": False,
         },
+    },
+    {
+        "name": "self_check_project",
+        "title": "自检项目敏感信息",
+        "description": "只在本机扫描所选项目拟上传文件及其 Git 历史中的疑似 API Key、Token、密码和凭据文件，同时报告其他上传阻止项；不需要 GitHub 登录或仓库名，也不会创建上传计划。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"project_id": {"type": "string"}},
+            "required": ["project_id"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+        "_meta": UI_META,
     },
     {
         "name": "preflight_upload",
@@ -121,7 +135,7 @@ TOOLS: list[dict[str, Any]] = [
         "name": "execute_upload",
         "title": "确认并上传到 GitHub",
         "description": (
-            "执行已通过预检的一次性上传计划：可能初始化 Git、提交当前项目、创建 GitHub 仓库并推送。"
+            "执行已通过预检的一次性上传计划：可能初始化 Git，或为父仓库内子目录生成不修改本地 Git 的隔离快照，然后创建 GitHub 仓库并推送。"
             "只有在用户已经明确确认卡片中显示的目标仓库和可见性后才能调用。"
             "公开仓库还必须把完整 owner/repo 传入 confirm_public_repository。"
         ),
@@ -201,6 +215,18 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 ),
             }
             return _text_result(payload, f"项目已加入上传列表：{payload['project']['name']}")
+        if name == "self_check_project":
+            payload = {
+                "ok": True,
+                "view": "self_check",
+                **uploader_core.self_check_project(_required_string(arguments, "project_id")),
+            }
+            message = (
+                f"本地自检完成：{payload['files']['count']} 个文件，"
+                f"疑似凭据 {payload['credential_issue_count']} 项，"
+                f"其他问题 {payload['other_issue_count']} 项；未上传。"
+            )
+            return _text_result(payload, message)
         if name == "preflight_upload":
             payload = {
                 "ok": True,
@@ -214,8 +240,13 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             repository = payload["repository"]
             visibility_label = "公开" if repository["visibility"] == "public" else "私有"
             status = "通过，等待确认" if payload["ready"] else "未通过，尚未上传"
+            mode_label = (
+                "；隔离子目录"
+                if payload.get("project", {}).get("isolated_subdirectory")
+                else ""
+            )
             message = (
-                f"预检{status}：{repository['name_with_owner']}（{visibility_label}）；"
+                f"预检{status}：{repository['name_with_owner']}（{visibility_label}）{mode_label}；"
                 f"{payload['files']['count']} 个文件，阻止 {payload['blocking_issue_count']}，"
                 f"警告 {payload['warning_count']}。"
             )
@@ -231,6 +262,12 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             }
             if payload.get("dry_run") or payload.get("uploaded") is False:
                 return _text_result(payload, f"测试模式完成，未上传：{payload.get('repository_url', '')}")
+            if (
+                payload.get("upload_mode") == uploader_core.UPLOAD_MODE_ISOLATED_SUBDIRECTORY
+                and payload.get("created_repository") is False
+                and payload.get("created_commit") is False
+            ):
+                return _text_result(payload, f"远程项目已是最新：{payload.get('repository_url', '')}")
             return _text_result(payload, f"上传完成：{payload.get('repository_url', '')}")
         raise uploader_core.UploadError("未知工具；请刷新插件后重试。")
     except Exception as exc:

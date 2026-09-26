@@ -31,6 +31,7 @@ class ServerContractTests(unittest.TestCase):
         preflight_payload = {
             "plan_id": "plan",
             "ready": True,
+            "project": {"isolated_subdirectory": True},
             "repository": {
                 "name_with_owner": "octocat/example",
                 "visibility": "public",
@@ -47,11 +48,27 @@ class ServerContractTests(unittest.TestCase):
             )
         preflight_text = preflight["content"][0]["text"]
         self.assertIn("octocat/example", preflight_text)
+        self.assertIn("隔离子目录", preflight_text)
         self.assertNotIn("/private/example", preflight_text)
         self.assertLess(
             len(preflight_text.encode()),
             len(json.dumps(preflight["structuredContent"]).encode()) // 2,
         )
+
+        self_check_payload = {
+            "project": {"name": "Example", "path": "/private/example"},
+            "files": {"count": 2},
+            "credential_issue_count": 1,
+            "credential_findings": [{"code": "current_assigned_secret", "path": "settings.py", "line": 1}],
+            "other_issue_count": 0,
+            "other_issues": [],
+        }
+        with mock.patch.object(server.uploader_core, "self_check_project", return_value=self_check_payload):
+            checked = server._call_tool("self_check_project", {"project_id": "p1"})
+        self.assertEqual(checked["structuredContent"]["view"], "self_check")
+        self.assertIn("疑似凭据 1 项", checked["content"][0]["text"])
+        self.assertNotIn("/private/example", checked["content"][0]["text"])
+        self.assertNotIn("settings.py", checked["content"][0]["text"])
 
     def test_initialize_negotiates_only_supported_handshake_versions(self) -> None:
         for version in server.HANDSHAKE_PROTOCOL_VERSIONS:
@@ -75,6 +92,13 @@ class ServerContractTests(unittest.TestCase):
         self.assertIn("公开仓库不会从卡片直接执行", html)
         self.assertIn("测试模式完成，未上传", html)
         self.assertIn('callTool("execute_upload", { plan_id: plan.plan_id }, 1850000)', html)
+        self.assertIn("独立子目录 · main", html)
+        self.assertIn("不含父仓库历史", html)
+        self.assertIn("远程项目已是最新", html)
+        self.assertIn("正在检查敏感文件、项目内容与仓库冲突", html)
+        self.assertIn('id="selfCheckButton"', html)
+        self.assertIn('callTool("self_check_project", { project_id: state.selectedId }', html)
+        self.assertIn("radio.disabled = !project.exists;", html)
 
     def test_ui_resource_metadata_allows_github_link(self) -> None:
         self.assertEqual(server.RESOURCE_MIME, "text/html;profile=mcp-app")
@@ -120,7 +144,10 @@ class ServerContractTests(unittest.TestCase):
         self.assertEqual(set(responses), {1, 2, 3})
         self.assertEqual(responses[1]["result"]["serverInfo"]["name"], "github-project-uploader")
         tools = responses[2]["result"]["tools"]
-        self.assertEqual(len(tools), 5)
+        self.assertEqual(len(tools), 6)
+        self_check = next(tool for tool in tools if tool["name"] == "self_check_project")
+        self.assertTrue(self_check["annotations"]["readOnlyHint"])
+        self.assertFalse(self_check["annotations"]["openWorldHint"])
         execute = next(tool for tool in tools if tool["name"] == "execute_upload")
         self.assertTrue(execute["annotations"]["destructiveHint"])
         content = responses[3]["result"]["contents"][0]
@@ -152,6 +179,10 @@ class ServerContractTests(unittest.TestCase):
         self.assertEqual(entry["name"], "github-project-uploader")
         self.assertEqual(entry["source"]["source"], "url")
         self.assertTrue(entry["source"]["url"].endswith("/github-project-uploader.git"))
+        manifest = json.loads((PLUGIN_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        base_version = manifest["version"].split("+", 1)[0]
+        self.assertEqual(base_version, server.SERVER_VERSION)
+        self.assertIn(f'appInfo: {{ name: "github-project-uploader", version: "{base_version}" }}', server.uploader_ui())
 
 
 if __name__ == "__main__":

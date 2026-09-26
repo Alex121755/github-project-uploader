@@ -4,7 +4,7 @@
   <img src="assets/logo.svg" width="96" alt="GitHub Project Uploader logo">
 </p>
 
-A safety-first Codex plugin for choosing a local project, running fail-closed checks, and pushing one exact commit to GitHub only after explicit confirmation.
+A safety-first Codex plugin for choosing a local project—or a non-repository project directory inside a larger Git repository—running fail-closed checks, and pushing one exact commit to GitHub only after explicit confirmation.
 
 [中文说明](README.zh-CN.md) · [Security model](docs/security-model.md) · [Report a vulnerability](SECURITY.md)
 
@@ -18,10 +18,12 @@ Publishing a local folder is easy to get wrong: ignored credentials may still ex
 The plugin provides:
 
 - An interactive project picker in supported Codex local-plugin surfaces.
-- A local registry for adding exact project roots.
+- A one-click local credential self-check for selected files and reachable Git history, with no GitHub sign-in or repository name required.
+- A local registry for adding exact project directories, including non-repository subdirectories isolated from larger Git repositories.
 - A ten-minute, one-time preflight plan before every upload.
 - Heuristic secret scanning across selected files and bounded Git history.
-- Checks for Git state, hidden index flags, remote conflicts, oversized content, nested repositories, shallow/partial clones, and Git LFS.
+- Checks for Git state, hidden index flags, remote conflicts, oversized content, nested repositories inside the selection, shallow/partial clones, and Git LFS.
+- An isolated-subdirectory mode that neither inherits nor modifies the parent repository's history, index, configuration, remotes, or ignore rules.
 - An isolated push of one exact commit, followed by verification of the remote branch object ID.
 - Private repositories by default and a separate exact-name confirmation for public repositories.
 
@@ -29,7 +31,7 @@ The plugin provides:
 
 - It is not a backup or continuous-sync tool.
 - It never force-pushes, mirror-pushes, deletes repositories, rewrites history, or silently replaces `origin`.
-- It does not upload Git LFS objects, submodules, nested repositories, shallow clones, or partial clones.
+- It does not upload Git LFS objects, submodules, repositories nested inside the selected directory, shallow clones, or partial clones. A Git repository above the selected directory is supported through isolated-subdirectory mode.
 - It does not prove that a project contains no secrets, personal information, malicious code, dependency vulnerabilities, licensing conflicts, or organization-policy violations.
 - It does not automatically write a README or choose a license for projects you upload.
 
@@ -100,9 +102,9 @@ or:
 
 Then:
 
-1. Choose a registered project, or register one exact project-root path.
-2. Enter a GitHub repository name.
-3. Run the preflight and review every blocker and warning.
+1. Choose a registered project, or register one exact absolute project-directory path. A directory without its own Git metadata below a larger Git repository is shown as an isolated subdirectory; a repository rooted at the selection keeps standard Git mode.
+2. Optionally run “Sensitive information self-check.” It reports possible API keys, tokens, passwords, credential files, and other upload issues by rule and location, without showing matched values or creating an upload plan.
+3. To upload, enter a GitHub repository name and run a fresh preflight. Review every blocker and warning.
 4. For a private repository, confirm the one-time plan in the card.
 5. For a public repository, return to the conversation and explicitly confirm the full `owner/repository` shown by preflight.
 
@@ -113,14 +115,15 @@ A plan expires after ten minutes and can be used only once. Any material project
 | Situation | Local changes | GitHub changes |
 | --- | --- | --- |
 | Folder is not yet a Git repository | Initializes `main`, stages files allowed by `.gitignore`, creates one root commit named `Initial project upload`, and adds `origin` | Creates the requested repository and pushes that commit |
+| Project directory inside a larger Git repository | Makes no change to the selected directory or parent Git repository; builds a complete snapshot in temporary Git metadata using only ignore/attribute files inside the selection | Creates a root snapshot on first upload; later content changes create a fast-forward snapshot whose only parent is the previously bound `main` commit; unchanged content reuses that commit |
 | Git repository with no commits yet | Stages files allowed by `.gitignore`, creates one root commit named `Initial project upload`, and adds `origin` when absent | Creates the target if absent, or verifies its visibility when a matching `origin` already points to it, then pushes that commit |
 | Existing clean repository with at least one commit and no `origin` | Adds the exact GitHub SSH `origin`; does not create a new commit | Requires the target repository not to exist, then creates it and pushes current `HEAD` to the current branch |
 | Existing clean repository with the matching `origin` | No history rewrite and no new commit | Creates the target if absent, or verifies its visibility if present, then pushes current `HEAD` to the current branch |
 | A later step fails | Earlier local initialization, commit, or `origin` may remain | An empty repository may already exist |
 
-The push includes the selected commit and its reachable ancestors. It does not push unrelated branches or tags. After pushing, the plugin reads the remote ref and requires its object ID to match exactly before reporting success.
+The push includes the selected commit and its reachable ancestors. For an isolated subdirectory, those ancestors are only snapshots previously created by this plugin; parent-repository history is excluded. It does not push unrelated branches or tags. After pushing, the plugin reads the remote ref and requires its object ID to match exactly before reporting success.
 
-The plugin never adopts an existing GitHub repository unless the local `origin` already matches the exact target.
+The plugin never adopts an existing GitHub repository unless a normal local repository has the exact matching `origin`, or an isolated subdirectory is already bound to the same immutable GitHub repository ID, visibility, branch, and last commit.
 
 The plugin does not automatically roll back partial work. Fix the reported authentication or network issue and run preflight again. Deleting a repository or undoing local Git initialization must remain a separate, explicit user action.
 
@@ -133,12 +136,12 @@ Preflight blocks or warns on conditions including:
 - Dirty worktrees, index/worktree mismatches, `assume-unchanged`, and `skip-worktree` entries.
 - Replace refs, grafts, executable Git filters, unsafe includes, URL rewrites, hooks, and transport overrides.
 - Mismatched fetch/push URLs or a target repository with different visibility.
-- Bare, nested, shallow, or partial repositories; submodules; and Git LFS attributes/pointers.
+- Bare, shallow, or partial repositories; repositories/submodules inside the selected tree; and Git LFS attributes/pointers.
 - More than 50,000 selected files or more than 2 GiB of selected content.
 - Files at or above GitHub's practical size thresholds: 50 MiB warns and 100 MiB blocks.
 - Scan inventories above 200,000 history objects or 200,000 historical paths.
 
-Current-content and history scans are deliberately bounded to avoid unbounded memory and time use. Reaching a safety limit blocks the upload instead of silently skipping the check. See the [security model](docs/security-model.md) for exact budgets and non-guarantees.
+The standalone self-check and upload preflight use the same local scan rules. Current-content and history scans are deliberately bounded to avoid unbounded memory and time use. Reaching a safety limit appears as an issue and blocks upload instead of silently skipping the check. Zero matches do not establish that no secret exists. See the [security model](docs/security-model.md) for exact budgets and non-guarantees.
 
 ## Privacy and local state
 
@@ -150,7 +153,7 @@ Codex receives project paths and redacted findings so it can explain blockers. D
 $CODEX_HOME/github-project-uploader/
 ```
 
-State files use owner-only permissions and may contain project paths, target repository details, commit/branch metadata, and the last successful URL. They do not store project file contents or copy the GitHub token. Token storage remains the responsibility of GitHub CLI and the operating system.
+State files use owner-only permissions and may contain project paths, upload mode, target repository identity, commit/branch metadata, pending recovery metadata, and the last successful URL. They do not store project file contents or copy the GitHub token. Token storage remains the responsibility of GitHub CLI and the operating system.
 
 ## Troubleshooting
 
@@ -159,6 +162,9 @@ State files use owner-only permissions and may contain project paths, target rep
 - **SSH fails:** verify direct access with the SSH test command above. Custom `~/.ssh/config` settings are intentionally ignored.
 - **Dirty repository:** commit, stash, or discard the changes yourself, then run a new preflight.
 - **Wrong `origin`:** resolve it manually. The plugin will not replace it.
+- **Isolated subdirectory:** parent `.gitignore` rules do not apply. Add required ignore rules inside the selected directory; the uploader will not create a `.git` there.
+- **Isolated creation failed:** retry the same exact target. Execution binds that target before creation so a failed attempt cannot silently switch to a different repository name.
+- **Parent relationship changed:** register the exact directory again to explicitly switch into isolated-subdirectory mode.
 - **Shallow or partial clone:** fetch a complete local history before retrying.
 - **Git LFS detected:** migrate the project away from LFS for this upload or use a separate LFS-aware workflow.
 - **Plan expired/project changed:** run preflight again; old plans cannot be reused.

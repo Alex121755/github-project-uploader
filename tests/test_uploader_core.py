@@ -67,6 +67,74 @@ class UploaderCoreTests(unittest.TestCase):
         self.assertEqual(first["project"]["id"], second["project"]["id"])
         self.assertEqual(self.state.joinpath("projects.json").stat().st_mode & 0o777, 0o600)
 
+    def test_self_check_finds_prefixed_api_key_without_github_or_value_exposure(self) -> None:
+        (self.project / ".gitignore").write_text("\n", encoding="utf-8")
+        secret = "sample" + "SecretValue" * 3
+        (self.project / "settings.py").write_text(
+            "# local settings\nOPENAI_" + "API_KEY = '" + secret + "'\n",
+            encoding="utf-8",
+        )
+        project = self.register()
+        with mock.patch.object(core, "github_owner", side_effect=AssertionError("unexpected GitHub call")), mock.patch.object(
+            core, "_repo_view", side_effect=AssertionError("unexpected GitHub call")
+        ):
+            result = core.self_check_project(project["id"])
+        findings = result["credential_findings"]
+        self.assertGreaterEqual(result["credential_issue_count"], 1)
+        self.assertTrue(any(issue["code"] == "current_assigned_secret" and issue["line"] == 2 for issue in findings))
+        self.assertNotIn(secret, json.dumps(result, ensure_ascii=False))
+        self.assertFalse(self.state.joinpath("plans.json").exists())
+
+    def test_self_check_finds_quoted_json_api_key(self) -> None:
+        (self.project / ".gitignore").write_text("\n", encoding="utf-8")
+        secret = "sample" + "JsonConfigValue" * 3
+        (self.project / "config.json").write_text(
+            '{"provider_' + 'api_key": "' + secret + '"}\n',
+            encoding="utf-8",
+        )
+        project = self.register()
+        result = core.self_check_project(project["id"])
+        self.assertTrue(any(issue["code"] == "current_assigned_secret" for issue in result["credential_findings"]))
+        self.assertNotIn(secret, json.dumps(result, ensure_ascii=False))
+
+    def test_self_check_finds_deleted_secret_in_git_history(self) -> None:
+        subprocess.run([core._git_executable(), "-C", str(self.project), "init", "-b", "main"], check=True, capture_output=True)
+        subprocess.run([core._git_executable(), "-C", str(self.project), "config", "user.name", "Test"], check=True)
+        subprocess.run([core._git_executable(), "-C", str(self.project), "config", "user.email", "test@example.invalid"], check=True)
+        secret = "sample" + "HistoricalValue" * 3
+        candidate = self.project / "settings.txt"
+        candidate.write_text("SERVICE_" + "API_KEY=" + secret + "\n", encoding="utf-8")
+        subprocess.run([core._git_executable(), "-C", str(self.project), "add", "settings.txt"], check=True)
+        subprocess.run([core._git_executable(), "-C", str(self.project), "commit", "-m", "first"], check=True, capture_output=True)
+        candidate.write_text("safe\n", encoding="utf-8")
+        subprocess.run([core._git_executable(), "-C", str(self.project), "add", "settings.txt"], check=True)
+        subprocess.run([core._git_executable(), "-C", str(self.project), "commit", "-m", "remove"], check=True, capture_output=True)
+        project = self.register()
+        with mock.patch.object(core, "github_owner", side_effect=AssertionError("unexpected GitHub call")):
+            result = core.self_check_project(project["id"])
+        self.assertTrue(any(issue["code"] == "history_assigned_secret" for issue in result["credential_findings"]))
+        self.assertNotIn(secret, json.dumps(result, ensure_ascii=False))
+
+    def test_self_check_isolated_project_excludes_parent_content(self) -> None:
+        parent = self.root / "parent"
+        child = parent / "child"
+        child.mkdir(parents=True)
+        subprocess.run([core._git_executable(), "-C", str(parent), "init", "-b", "main"], check=True, capture_output=True)
+        (parent / "private.txt").write_text("OPENAI_" + "API_KEY=" + "sampleParentValue" * 3, encoding="utf-8")
+        (child / ".gitignore").write_text("\n", encoding="utf-8")
+        (child / "README.md").write_text("child only\n", encoding="utf-8")
+        project = core.register_project(str(child))["project"]
+        result = core.self_check_project(project["id"])
+        self.assertTrue(result["project"]["isolated_subdirectory"])
+        self.assertEqual(result["credential_issue_count"], 0)
+        self.assertEqual(result["files"]["count"], 2)
+
+    def test_project_execution_lock_rejects_concurrent_upload(self) -> None:
+        with core._project_execution_lock("project-id"):
+            with self.assertRaisesRegex(core.UploadError, "已有上传正在执行"):
+                with core._project_execution_lock("project-id"):
+                    self.fail("concurrent lock unexpectedly acquired")
+
     def test_rejects_home_and_invalid_repo_name(self) -> None:
         with self.assertRaises(core.UploadError):
             core._validate_project_path(str(Path.home()))
@@ -75,6 +143,11 @@ class UploaderCoreTests(unittest.TestCase):
         with mock.patch.object(core, "github_owner", return_value="ExampleUser"):
             with self.assertRaises(core.UploadError):
                 core.preflight_upload(project["id"], "bad;name")
+
+    def test_rejects_relative_project_path(self) -> None:
+        with mock.patch("pathlib.Path.cwd", return_value=self.root):
+            with self.assertRaisesRegex(core.UploadError, "绝对路径"):
+                core._validate_project_path("project")
 
     def test_rejects_codex_home_descendants(self) -> None:
         fake_codex_home = self.root / "codex-home"
@@ -279,6 +352,417 @@ class UploaderCoreTests(unittest.TestCase):
         self.assertFalse(result["ready"])
         self.assertIn("nested_repository", {issue["code"] for issue in result["issues"]})
 
+    def test_parent_repository_child_registers_as_isolated_snapshot(self) -> None:
+        parent = self.root / "parent"
+        child = parent / "child"
+        child.mkdir(parents=True)
+        subprocess.run([core._git_executable(), "-C", str(parent), "init", "-b", "main"], check=True, capture_output=True)
+        subprocess.run([core._git_executable(), "-C", str(parent), "config", "user.name", "Test"], check=True)
+        subprocess.run([core._git_executable(), "-C", str(parent), "config", "user.email", "test@example.invalid"], check=True)
+        (parent / ".gitignore").write_text("child/parent-ignored.txt\n", encoding="utf-8")
+        (parent / "historical-secret.txt").write_text(synthetic_github_token() + "\n", encoding="utf-8")
+        subprocess.run([core._git_executable(), "-C", str(parent), "add", ".gitignore", "historical-secret.txt"], check=True)
+        subprocess.run([core._git_executable(), "-C", str(parent), "commit", "-m", "parent only"], check=True, capture_output=True)
+
+        (child / ".gitignore").write_text(".env\n", encoding="utf-8")
+        (child / ".env").write_text(synthetic_secret_assignment(), encoding="utf-8")
+        (child / "README.md").write_text("child project\n", encoding="utf-8")
+        (child / "parent-ignored.txt").write_text("must be included\n", encoding="utf-8")
+        registered = core.register_project(str(child))["project"]
+        self.assertEqual(registered["upload_mode"], core.UPLOAD_MODE_ISOLATED_SUBDIRECTORY)
+        self.assertTrue(registered["inside_larger_repository"])
+        self.assertTrue(registered["isolated_subdirectory"])
+        self.assertFalse(registered["is_git_repository"])
+        self.assertEqual(registered["branch"], "main")
+
+        result = self.preflight(registered["id"])
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["project"]["upload_mode"], core.UPLOAD_MODE_ISOLATED_SUBDIRECTORY)
+        self.assertEqual(result["files"]["count"], 3)
+        self.assertEqual(result["files"]["history_blob_count"], 0)
+        self.assertNotIn("current_github_token", {issue["code"] for issue in result["issues"]})
+
+    def test_selected_nested_repository_root_keeps_its_own_git_mode(self) -> None:
+        parent = self.root / "parent"
+        child = parent / "child"
+        child.mkdir(parents=True)
+        subprocess.run([core._git_executable(), "-C", str(parent), "init", "-b", "main"], check=True, capture_output=True)
+        subprocess.run([core._git_executable(), "-C", str(child), "init", "-b", "main"], check=True, capture_output=True)
+        (child / "README.md").write_text("nested repository root\n", encoding="utf-8")
+        project = core.register_project(str(child))["project"]
+        self.assertEqual(project["upload_mode"], core.UPLOAD_MODE_STANDARD)
+        self.assertTrue(project["is_git_repository"])
+        self.assertFalse(project["inside_larger_repository"])
+        plan = self.preflight(project["id"])
+        self.assertTrue(plan["ready"])
+        self.assertEqual(plan["project"]["upload_mode"], core.UPLOAD_MODE_STANDARD)
+
+    def test_project_must_be_reregistered_when_it_moves_under_parent_git(self) -> None:
+        outer = self.root / "outer"
+        child = outer / "child"
+        child.mkdir(parents=True)
+        (child / "README.md").write_text("safe\n", encoding="utf-8")
+        project = core.register_project(str(child))["project"]
+        self.assertEqual(project["upload_mode"], core.UPLOAD_MODE_STANDARD)
+        subprocess.run([core._git_executable(), "-C", str(outer), "init", "-b", "main"], check=True, capture_output=True)
+        with self.assertRaisesRegex(core.UploadError, "重新添加"):
+            self.preflight(project["id"])
+        updated = core.register_project(str(child))["project"]
+        self.assertEqual(updated["upload_mode"], core.UPLOAD_MODE_ISOLATED_SUBDIRECTORY)
+
+    def test_isolated_snapshot_blocks_attribute_content_transformation(self) -> None:
+        parent = self.root / "parent"
+        child = parent / "child"
+        child.mkdir(parents=True)
+        subprocess.run([core._git_executable(), "-C", str(parent), "init", "-b", "main"], check=True, capture_output=True)
+        (child / ".gitattributes").write_text("*.txt text\n", encoding="utf-8")
+        (child / "notes.txt").write_bytes(b"line one\r\nline two\r\n")
+        project = core.register_project(str(child))["project"]
+        result = self.preflight(project["id"])
+        self.assertFalse(result["ready"])
+        self.assertIn("isolated_tree_unverifiable", {issue["code"] for issue in result["issues"]})
+
+    def test_isolated_snapshot_does_not_execute_parent_git_filters(self) -> None:
+        parent = self.root / "parent"
+        child = parent / "child"
+        child.mkdir(parents=True)
+        marker = self.root / "parent-filter-executed"
+        subprocess.run([core._git_executable(), "-C", str(parent), "init", "-b", "main"], check=True, capture_output=True)
+        subprocess.run(
+            [core._git_executable(), "-C", str(parent), "config", "filter.evil.clean", f"/usr/bin/touch {marker}; /bin/cat"],
+            check=True,
+        )
+        (parent / ".gitattributes").write_text("child/*.txt filter=evil\n", encoding="utf-8")
+        (child / ".gitignore").write_text("\n", encoding="utf-8")
+        (child / "README.txt").write_text("safe\n", encoding="utf-8")
+        project = core.register_project(str(child))["project"]
+        result = self.preflight(project["id"])
+        self.assertTrue(result["ready"])
+        self.assertFalse(marker.exists())
+
+    def test_isolated_snapshot_rejects_unbound_existing_target_and_remote_drift(self) -> None:
+        parent = self.root / "parent"
+        child = parent / "child"
+        child.mkdir(parents=True)
+        subprocess.run([core._git_executable(), "-C", str(parent), "init", "-b", "main"], check=True, capture_output=True)
+        (child / ".gitignore").write_text("\n", encoding="utf-8")
+        (child / "README.md").write_text("safe\n", encoding="utf-8")
+        project = core.register_project(str(child))["project"]
+        target = {
+            "nameWithOwner": "ExampleUser/safe-project",
+            "visibility": "private",
+            "url": "https://github.com/ExampleUser/safe-project",
+            "id": 12345,
+        }
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ):
+            unbound = core.preflight_upload(project["id"], "safe-project")
+        self.assertFalse(unbound["ready"])
+        self.assertIn("target_exists", {issue["code"] for issue in unbound["issues"]})
+
+        core._write_isolated_binding(
+            project["id"],
+            target="ExampleUser/safe-project",
+            visibility="private",
+            repository_id=12345,
+            last_commit_oid="a" * 40,
+            pending_commit_oid=None,
+            expected_binding_fingerprint=core._isolated_binding_fingerprint(None),
+        )
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ), mock.patch.object(core, "_isolated_remote_branch_oid", return_value="b" * 40):
+            drifted = core.preflight_upload(project["id"], "safe-project")
+        self.assertFalse(drifted["ready"])
+        self.assertIn("remote_branch_changed", {issue["code"] for issue in drifted["issues"]})
+        entry = next(candidate for candidate in core._load_registry()["projects"] if candidate["id"] == project["id"])
+        expected_binding = core._isolated_binding_fingerprint(core._isolated_remote_binding(entry))
+        core._write_isolated_binding(
+            project["id"],
+            target="ExampleUser/safe-project",
+            visibility="private",
+            repository_id=12345,
+            last_commit_oid="a" * 40,
+            pending_commit_oid="b" * 40,
+            expected_binding_fingerprint=expected_binding,
+        )
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ), mock.patch.object(core, "_isolated_remote_branch_oid", return_value="a" * 40):
+            retry_after_failed_push = core.preflight_upload(project["id"], "safe-project")
+        self.assertTrue(retry_after_failed_push["ready"])
+        self.assertEqual(retry_after_failed_push["git"]["remote_base_oid"], "a" * 40)
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ), mock.patch.object(core, "_isolated_remote_branch_oid", return_value="b" * 40):
+            recover_after_landed_push = core.preflight_upload(project["id"], "safe-project")
+        self.assertTrue(recover_after_landed_push["ready"])
+        self.assertEqual(recover_after_landed_push["git"]["remote_base_oid"], "b" * 40)
+        replaced_target = {**target, "id": 54321}
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=replaced_target
+        ):
+            replaced = core.preflight_upload(project["id"], "safe-project")
+        self.assertFalse(replaced["ready"])
+        self.assertIn("repository_identity_changed", {issue["code"] for issue in replaced["issues"]})
+
+    def test_isolated_snapshot_upload_and_repeat_update_leave_parent_untouched(self) -> None:
+        parent = self.root / "parent"
+        child = parent / "child"
+        child.mkdir(parents=True)
+        subprocess.run([core._git_executable(), "-C", str(parent), "init", "-b", "main"], check=True, capture_output=True)
+        subprocess.run([core._git_executable(), "-C", str(parent), "config", "user.name", "Parent"], check=True)
+        subprocess.run([core._git_executable(), "-C", str(parent), "config", "user.email", "parent@example.invalid"], check=True)
+        (parent / "parent.txt").write_text("outside selected directory\n", encoding="utf-8")
+        subprocess.run([core._git_executable(), "-C", str(parent), "add", "parent.txt"], check=True)
+        subprocess.run([core._git_executable(), "-C", str(parent), "commit", "-m", "parent"], check=True, capture_output=True)
+        (child / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+        (child / "ignored.txt").write_text("not uploaded\n", encoding="utf-8")
+        (child / "README.md").write_text("version one\n", encoding="utf-8")
+        (child / "remove-me.txt").write_text("remove later\n", encoding="utf-8")
+        project = core.register_project(str(child))["project"]
+        parent_head_before = subprocess.run(
+            [core._git_executable(), "-C", str(parent), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        parent_status_before = subprocess.run(
+            [core._git_executable(), "-C", str(parent), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        parent_config_before = (parent / ".git" / "config").read_bytes()
+        parent_index_before = (parent / ".git" / "index").read_bytes()
+
+        remote = self.root / "remote.git"
+        subprocess.run([core._git_executable(), "init", "--bare", str(remote)], check=True, capture_output=True)
+        target = {
+            "nameWithOwner": "ExampleUser/safe-project",
+            "visibility": "private",
+            "url": "https://github.com/ExampleUser/safe-project",
+            "id": 12345,
+        }
+        original_run = core.run_command
+
+        def localize_network(args: list[str], **kwargs: object) -> core.CommandResult:
+            if any(isinstance(value, str) and value == "git@github.com:ExampleUser/safe-project.git" for value in args):
+                localized = [str(remote) if value == "git@github.com:ExampleUser/safe-project.git" else value for value in args]
+                localized = ["protocol.file.allow=always" if value == "protocol.file.allow=never" else value for value in localized]
+                return original_run(localized, **kwargs)
+            return original_run(args, **kwargs)
+
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=None
+        ):
+            first_plan = core.preflight_upload(project["id"], "safe-project")
+        self.assertTrue(first_plan["ready"])
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", side_effect=[None, target, target, target]
+        ), mock.patch.object(
+            core, "_create_repository", return_value=target
+        ), mock.patch.object(core, "_gh_executable", return_value="/usr/bin/true"), mock.patch.object(
+            core, "run_command", side_effect=localize_network
+        ):
+            first = core.execute_upload(first_plan["plan_id"])
+        self.assertTrue(first["uploaded"])
+        self.assertTrue(first["created_repository"])
+        self.assertTrue(first["created_commit"])
+        first_oid = first["commit_oid"]
+        self.assertEqual(
+            subprocess.run(
+                [core._git_executable(), f"--git-dir={remote}", "rev-list", "--parents", "-n", "1", first_oid],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip().split(),
+            [first_oid],
+        )
+        self.assertEqual(
+            subprocess.run(
+                [core._git_executable(), f"--git-dir={remote}", "ls-tree", "-r", "--name-only", first_oid],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines(),
+            [".gitignore", "README.md", "remove-me.txt"],
+        )
+        self.assertFalse((child / ".git").exists())
+        self.assertEqual((parent / ".git" / "config").read_bytes(), parent_config_before)
+        self.assertEqual((parent / ".git" / "index").read_bytes(), parent_index_before)
+        self.assertEqual(
+            subprocess.run(
+                [core._git_executable(), "-C", str(parent), "status", "--porcelain=v1", "--untracked-files=all"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout,
+            parent_status_before,
+        )
+
+        (child / "README.md").write_text("version two\n", encoding="utf-8")
+        (child / "remove-me.txt").unlink()
+        executable = child / "run.sh"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        second_parent_status_before = subprocess.run(
+            [core._git_executable(), "-C", str(parent), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        second_parent_index_before = (parent / ".git" / "index").read_bytes()
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ), mock.patch.object(core, "run_command", side_effect=localize_network):
+            second_plan = core.preflight_upload(project["id"], "safe-project")
+        self.assertTrue(second_plan["ready"])
+        self.assertEqual(second_plan["git"]["remote_base_oid"], first_oid)
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ), mock.patch.object(core, "_gh_executable", return_value="/usr/bin/true"), mock.patch.object(
+            core, "run_command", side_effect=localize_network
+        ):
+            second = core.execute_upload(second_plan["plan_id"])
+        self.assertTrue(second["uploaded"])
+        self.assertTrue(second["created_commit"])
+        second_oid = second["commit_oid"]
+        remote_parents = subprocess.run(
+            [core._git_executable(), f"--git-dir={remote}", "rev-list", "--parents", "-n", "1", second_oid],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip().split()
+        self.assertEqual(remote_parents, [second_oid, first_oid])
+        remote_tree = subprocess.run(
+            [core._git_executable(), f"--git-dir={remote}", "ls-tree", "-r", "--name-only", second_oid],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        self.assertEqual(remote_tree, [".gitignore", "README.md", "run.sh"])
+        remote_mode = subprocess.run(
+            [core._git_executable(), f"--git-dir={remote}", "ls-tree", second_oid, "run.sh"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.split()[0]
+        self.assertEqual(remote_mode, "100755")
+
+        self.assertFalse((child / ".git").exists())
+        self.assertEqual((parent / ".git" / "config").read_bytes(), parent_config_before)
+        self.assertEqual((parent / ".git" / "index").read_bytes(), second_parent_index_before)
+        self.assertEqual(
+            subprocess.run(
+                [core._git_executable(), "-C", str(parent), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout,
+            parent_head_before,
+        )
+        self.assertEqual(
+            subprocess.run(
+                [core._git_executable(), "-C", str(parent), "status", "--porcelain=v1", "--untracked-files=all"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout,
+            second_parent_status_before,
+        )
+
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ), mock.patch.object(core, "run_command", side_effect=localize_network):
+            unchanged_plan = core.preflight_upload(project["id"], "safe-project")
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ), mock.patch.object(core, "_gh_executable", return_value="/usr/bin/true"), mock.patch.object(
+            core, "run_command", side_effect=localize_network
+        ):
+            unchanged = core.execute_upload(unchanged_plan["plan_id"])
+        self.assertFalse(unchanged["created_commit"])
+        self.assertEqual(unchanged["commit_oid"], second_oid)
+
+        for candidate in child.iterdir():
+            candidate.unlink()
+        empty_parent_status_before = subprocess.run(
+            [core._git_executable(), "-C", str(parent), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        empty_parent_index_before = (parent / ".git" / "index").read_bytes()
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ), mock.patch.object(core, "run_command", side_effect=localize_network):
+            empty_plan = core.preflight_upload(project["id"], "safe-project")
+        self.assertTrue(empty_plan["ready"])
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ), mock.patch.object(core, "_gh_executable", return_value="/usr/bin/true"), mock.patch.object(
+            core, "run_command", side_effect=localize_network
+        ):
+            emptied = core.execute_upload(empty_plan["plan_id"])
+        self.assertTrue(emptied["created_commit"])
+        self.assertEqual(
+            subprocess.run(
+                [core._git_executable(), f"--git-dir={remote}", "rev-list", "--parents", "-n", "1", emptied["commit_oid"]],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip().split(),
+            [emptied["commit_oid"], second_oid],
+        )
+        self.assertEqual(
+            subprocess.run(
+                [core._git_executable(), f"--git-dir={remote}", "ls-tree", "-r", "--name-only", emptied["commit_oid"]],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout,
+            "",
+        )
+        self.assertFalse((child / ".git").exists())
+        self.assertEqual((parent / ".git" / "index").read_bytes(), empty_parent_index_before)
+        self.assertEqual(
+            subprocess.run(
+                [core._git_executable(), "-C", str(parent), "status", "--porcelain=v1", "--untracked-files=all"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout,
+            empty_parent_status_before,
+        )
+
+        (child / "replacement-race.txt").write_text("detect replacement\n", encoding="utf-8")
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ), mock.patch.object(core, "run_command", side_effect=localize_network):
+            replacement_plan = core.preflight_upload(project["id"], "safe-project")
+        replacement_target = {**target, "id": 54321}
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", side_effect=[target, target, target, replacement_target]
+        ), mock.patch.object(core, "_gh_executable", return_value="/usr/bin/true"), mock.patch.object(
+            core, "run_command", side_effect=localize_network
+        ):
+            with self.assertRaisesRegex(core.UploadError, "推送后无法确认"):
+                core.execute_upload(replacement_plan["plan_id"])
+        replacement_oid = subprocess.run(
+            [core._git_executable(), f"--git-dir={remote}", "rev-parse", "refs/heads/main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertNotEqual(replacement_oid, emptied["commit_oid"])
+        entry = next(candidate for candidate in core._load_registry()["projects"] if candidate["id"] == project["id"])
+        binding = core._isolated_remote_binding(entry)
+        self.assertEqual(binding["repository_id"], target["id"])
+        self.assertEqual(binding["last_commit_oid"], emptied["commit_oid"])
+        self.assertEqual(binding["pending_commit_oid"], replacement_oid)
+
     def test_http_remote_is_sanitized(self) -> None:
         remote = "https:" + "//secret-user:secret-pass@github.com/ExampleUser/safe-project.git?access_token=topsecret#fragment"
         sanitized = core._safe_remote_url(remote)
@@ -321,6 +805,70 @@ class UploaderCoreTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(core.UploadError, "无法解析"):
                 core._repo_view("ExampleUser", "missing")
+
+    def test_create_repository_captures_identity_from_creation_response(self) -> None:
+        response = {
+            "full_name": "ExampleUser/safe-project",
+            "html_url": "https://github.com/ExampleUser/safe-project",
+            "visibility": "private",
+            "private": True,
+            "id": 12345,
+        }
+        with mock.patch.object(core, "_gh_executable", return_value="gh"), mock.patch.object(
+            core,
+            "run_command",
+            return_value=core.CommandResult(0, json.dumps(response), ""),
+        ) as command:
+            created = core._create_repository("ExampleUser", "safe-project", "private")
+        self.assertEqual(created["id"], 12345)
+        self.assertEqual(
+            command.call_args.args[0],
+            ["gh", "api", "--method", "POST", "user/repos", "--input", "-"],
+        )
+        self.assertEqual(
+            json.loads(command.call_args.kwargs["input_text"]),
+            {"name": "safe-project", "private": True},
+        )
+
+    def test_isolated_creation_never_binds_a_same_name_replacement(self) -> None:
+        parent = self.root / "parent"
+        child = parent / "child"
+        child.mkdir(parents=True)
+        subprocess.run([core._git_executable(), "-C", str(parent), "init", "-b", "main"], check=True, capture_output=True)
+        (child / "README.md").write_text("safe\n", encoding="utf-8")
+        project = core.register_project(str(child))["project"]
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=None
+        ):
+            plan = core.preflight_upload(project["id"], "safe-project")
+        created_target = {
+            "nameWithOwner": "ExampleUser/safe-project",
+            "visibility": "private",
+            "url": "https://github.com/ExampleUser/safe-project",
+            "id": 12345,
+        }
+        replacement_target = {**created_target, "id": 54321}
+        original_run = core.run_command
+        pushes: list[list[str]] = []
+
+        def capture_push(args: list[str], **kwargs: object) -> core.CommandResult:
+            if "push" in args:
+                pushes.append(args)
+            return original_run(args, **kwargs)
+
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", side_effect=[None, replacement_target]
+        ), mock.patch.object(core, "_create_repository", return_value=created_target), mock.patch.object(
+            core, "run_command", side_effect=capture_push
+        ):
+            with self.assertRaisesRegex(core.UploadError, "固定身份已变化"):
+                core.execute_upload(plan["plan_id"])
+        self.assertEqual(pushes, [])
+        entry = next(candidate for candidate in core._load_registry()["projects"] if candidate["id"] == project["id"])
+        binding = core._isolated_remote_binding(entry)
+        self.assertIsNone(binding["repository_id"])
+        self.assertIsNone(binding["last_commit_oid"])
+        self.assertIsNotNone(binding["pending_commit_oid"])
 
     def test_git_commands_disable_project_execution_paths(self) -> None:
         command = core._git_command(self.project, "status")

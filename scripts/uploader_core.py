@@ -31,6 +31,9 @@ MAX_HISTORY_PATH_OUTPUT_BYTES = 32 * 1024 * 1024
 MAX_HISTORY_OBJECTS = 200_000
 MAX_HISTORY_OBJECT_OUTPUT_BYTES = 64 * 1024 * 1024
 MAX_ATTRIBUTES_FILE_BYTES = 1024 * 1024
+UPLOAD_MODE_STANDARD = "standard"
+UPLOAD_MODE_ISOLATED_SUBDIRECTORY = "isolated_subdirectory"
+ISOLATED_SUBDIRECTORY_BRANCH = "main"
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
@@ -76,10 +79,17 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "assigned_secret",
         re.compile(
-            r"(?i)\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password)"
-            r"\s*[:=]\s*['\"]?[A-Za-z0-9_./+=-]{16,}"
+            r"(?i)(?<![A-Za-z0-9])['\"]?(?:[A-Za-z][A-Za-z0-9_.-]{0,64})?"
+            r"(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
+            r"secret[_-]?(?:access[_-]?)?key|password|token)"
+            r"['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9_./+=-]{16,}"
         ),
     ),
+)
+
+CREDENTIAL_ISSUE_RULES = frozenset(
+    {code for code, _ in SECRET_PATTERNS}
+    | {"environment_file", "credential_file", "private_key_or_certificate", "aws_credentials", "service_" + "account"}
 )
 
 # Assemble these markers at runtime so this scanner does not mistake its own
@@ -318,8 +328,11 @@ def _git_push_command(git_dir: Path, remote_url: str, oid: str, branch: str) -> 
     ]
 
 
-def _verify_remote_branch(cwd: Path, remote_url: str, oid: str, branch: str) -> None:
+def _remote_branch_oid(cwd: Path, remote_url: str, branch: str) -> str | None:
     ref = f"refs/heads/{branch}"
+    checked = run_command([_git_executable(), "check-ref-format", ref], check=False, timeout=30)
+    if checked.returncode != 0:
+        raise UploadError("远程分支名无效；请重新预检。")
     result = run_command(
         [
             _git_executable(),
@@ -343,8 +356,22 @@ def _verify_remote_branch(cwd: Path, remote_url: str, oid: str, branch: str) -> 
         env_overrides=SAFE_PUSH_ENV,
     )
     lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
     fields = lines[0].split("\t", 1) if len(lines) == 1 else []
-    if len(fields) != 2 or fields[0].lower() != oid.lower() or fields[1] != ref:
+    if len(fields) != 2 or not re.fullmatch(r"[0-9a-fA-F]{40,64}", fields[0]) or fields[1] != ref:
+        raise UploadError("无法可靠确认 GitHub 远程分支；请重新预检。")
+    return fields[0].lower()
+
+
+def _isolated_remote_branch_oid(remote_url: str, branch: str) -> str | None:
+    with tempfile.TemporaryDirectory(prefix="codex-github-ls-remote-") as temporary:
+        return _remote_branch_oid(Path(temporary), remote_url, branch)
+
+
+def _verify_remote_branch(cwd: Path, remote_url: str, oid: str, branch: str) -> None:
+    remote_oid = _remote_branch_oid(cwd, remote_url, branch)
+    if remote_oid is None or remote_oid != oid.lower():
         raise UploadError("推送命令结束，但 GitHub 分支未指向已确认提交；请检查仓库后重新预检。")
 
 
@@ -409,6 +436,256 @@ def _isolated_push_repository(path: Path, oid: str):
         yield transport_root, git_dir, transport_env
 
 
+def _isolated_worktree_command(git_dir: Path, work_tree: Path, *args: str) -> list[str]:
+    return [
+        _git_executable(),
+        "--no-replace-objects",
+        "--no-lazy-fetch",
+        "-C",
+        str(work_tree),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.fileMode=true",
+        "-c",
+        "core.symlinks=true",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-c",
+        "core.excludesFile=/dev/null",
+        "-c",
+        "commit.gpgSign=false",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "gc.auto=0",
+        f"--git-dir={git_dir}",
+        f"--work-tree={work_tree}",
+        *args,
+    ]
+
+
+def _git_fetch_branch_command(git_dir: Path, remote_url: str, branch: str) -> list[str]:
+    remote_ref = f"refs/heads/{branch}"
+    checked = run_command([_git_executable(), "check-ref-format", remote_ref], check=False, timeout=30)
+    if checked.returncode != 0:
+        raise UploadError("远程分支名无效；请重新预检。")
+    return [
+        _git_executable(),
+        "--no-replace-objects",
+        "--no-lazy-fetch",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "fetch.fsckObjects=true",
+        "-c",
+        "transfer.fsckObjects=true",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "protocol.file.allow=never",
+        "-c",
+        "protocol.ext.allow=never",
+        f"--git-dir={git_dir}",
+        "fetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--recurse-submodules=no",
+        remote_url,
+        f"{remote_ref}:refs/codex-uploader/base",
+    ]
+
+
+def _isolated_index_entries(git_dir: Path, work_tree: Path, index_env: dict[str, str]) -> dict[str, tuple[str, str]]:
+    staged = run_command(
+        _isolated_worktree_command(git_dir, work_tree, "ls-files", "--stage", "-z"),
+        timeout=120,
+        env_overrides=index_env,
+    )
+    entries: dict[str, tuple[str, str]] = {}
+    for entry in staged.stdout.split("\0"):
+        if not entry:
+            continue
+        if "\t" not in entry:
+            raise UploadError("隔离快照的 Git 索引格式异常；上传已停止。")
+        metadata, relative = entry.split("\t", 1)
+        fields = metadata.split(" ")
+        if len(fields) != 3:
+            raise UploadError("隔离快照的 Git 索引格式异常；上传已停止。")
+        mode, oid, stage = fields
+        if (
+            stage != "0"
+            or not re.fullmatch(r"(?:100644|100755|120000)", mode)
+            or not re.fullmatch(r"[0-9a-fA-F]{40,64}", oid)
+            or relative in entries
+        ):
+            raise UploadError("隔离快照包含异常 Git 索引条目；上传已停止。")
+        entries[relative] = (mode, oid.lower())
+    return entries
+
+
+def _verify_isolated_index(git_dir: Path, work_tree: Path, index_env: dict[str, str]) -> None:
+    selected, _, nested = _new_repo_files(work_tree)
+    if nested:
+        raise UploadError("隔离子目录在生成提交时出现嵌套 Git 仓库；上传已停止。")
+    entries = _isolated_index_entries(git_dir, work_tree, index_env)
+    if set(entries) != set(selected):
+        raise UploadError("隔离提交的文件清单与预检清单不一致；上传已停止。")
+    regular: list[str] = []
+    for relative in selected:
+        if "\n" in relative or "\r" in relative:
+            raise UploadError("隔离提交包含无法安全核对的文件名；上传已停止。")
+        candidate = work_tree / relative
+        try:
+            info = candidate.lstat()
+        except OSError as exc:
+            raise UploadError("隔离提交的文件在核对时发生变化；上传已停止。") from exc
+        mode, expected_oid = entries[relative]
+        if stat.S_ISLNK(info.st_mode):
+            if mode != "120000":
+                raise UploadError("隔离提交的符号链接模式不一致；上传已停止。")
+            try:
+                actual_oid = _blob_oid(os.fsencode(os.readlink(candidate)), "sha1")
+            except OSError as exc:
+                raise UploadError("隔离提交的符号链接无法读取；上传已停止。") from exc
+            if actual_oid != expected_oid:
+                raise UploadError("隔离提交的符号链接内容不一致；上传已停止。")
+            continue
+        expected_mode = "100755" if info.st_mode & 0o111 else "100644"
+        if not stat.S_ISREG(info.st_mode) or mode != expected_mode:
+            raise UploadError("隔离提交的文件类型或可执行位不一致；上传已停止。")
+        regular.append(relative)
+    if regular:
+        hashed = run_command(
+            _isolated_worktree_command(git_dir, work_tree, "hash-object", "--no-filters", "--stdin-paths"),
+            input_text="".join(f"{relative}\n" for relative in regular),
+            check=False,
+            timeout=600,
+            env_overrides=index_env,
+        )
+        hashes = hashed.stdout.splitlines()
+        if hashed.returncode != 0 or len(hashes) != len(regular):
+            raise UploadError("无法核对隔离提交的文件内容；上传已停止。")
+        for relative, actual_oid in zip(regular, hashes, strict=True):
+            if actual_oid.lower() != entries[relative][1]:
+                raise UploadError("隔离提交的文件内容与工作目录不一致；上传已停止。")
+
+
+@contextmanager
+def _isolated_snapshot_repository(
+    path: Path,
+    owner: str,
+    remote_url: str,
+    base_oid: str | None,
+):
+    if base_oid is not None and not re.fullmatch(r"[0-9a-fA-F]{40}", base_oid):
+        raise UploadError("隔离项目的远程基准提交无效；请重新预检。")
+    with tempfile.TemporaryDirectory(prefix="codex-github-snapshot-") as temporary:
+        temporary_root = Path(temporary)
+        empty_template = temporary_root / "empty-template"
+        empty_template.mkdir()
+        repository = temporary_root / "repository"
+        run_command(
+            [
+                _git_executable(),
+                "--no-replace-objects",
+                "--no-lazy-fetch",
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "gc.auto=0",
+                "init",
+                "--quiet",
+                f"--template={empty_template}",
+                "--object-format=sha1",
+                "-b",
+                ISOLATED_SUBDIRECTORY_BRANCH,
+                str(repository),
+            ],
+            timeout=60,
+            env_overrides=ISOLATED_GIT_CONFIG_ENV,
+        )
+        git_dir = repository / ".git"
+        if base_oid is not None:
+            run_command(
+                _git_fetch_branch_command(git_dir, remote_url, ISOLATED_SUBDIRECTORY_BRANCH),
+                timeout=1800,
+                env_overrides=SAFE_PUSH_ENV,
+            )
+            fetched = run_command(
+                _isolated_worktree_command(git_dir, path, "rev-parse", "--verify", "refs/codex-uploader/base^{commit}"),
+                timeout=60,
+            ).stdout.strip().lower()
+            if fetched != base_oid.lower():
+                raise UploadError("远程分支在获取期间发生变化；请重新预检。")
+        index_env = {**ISOLATED_GIT_CONFIG_ENV, "GIT_INDEX_FILE": str(temporary_root / "snapshot.index")}
+        run_command(
+            _isolated_worktree_command(git_dir, path, "read-tree", "--empty"),
+            timeout=60,
+            env_overrides=index_env,
+        )
+        run_command(
+            _isolated_worktree_command(git_dir, path, "add", "-A", "--", "."),
+            timeout=600,
+            env_overrides=index_env,
+        )
+        _verify_isolated_index(git_dir, path, index_env)
+        tree_oid = run_command(
+            _isolated_worktree_command(git_dir, path, "write-tree"),
+            timeout=120,
+            env_overrides=index_env,
+        ).stdout.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", tree_oid):
+            raise UploadError("无法固定隔离项目的 Git 文件树；上传已停止。")
+        commit_oid: str
+        created_commit = True
+        if base_oid is not None:
+            base_tree = run_command(
+                _isolated_worktree_command(git_dir, path, "rev-parse", "--verify", f"{base_oid}^{{tree}}"),
+                timeout=60,
+            ).stdout.strip().lower()
+            if base_tree == tree_oid:
+                commit_oid = base_oid.lower()
+                created_commit = False
+            else:
+                commit_oid = ""
+        else:
+            commit_oid = ""
+        if created_commit:
+            identity_env = {
+                **index_env,
+                "GIT_AUTHOR_NAME": owner,
+                "GIT_COMMITTER_NAME": owner,
+                "GIT_AUTHOR_EMAIL": f"{owner}@users.noreply.github.com",
+                "GIT_COMMITTER_EMAIL": f"{owner}@users.noreply.github.com",
+            }
+            commit_args = ["commit-tree", tree_oid]
+            if base_oid is not None:
+                commit_args.extend(["-p", base_oid])
+            message = "Initial project upload" if base_oid is None else "Update project snapshot"
+            commit_args.extend(["-m", message])
+            commit_oid = run_command(
+                _isolated_worktree_command(git_dir, path, *commit_args),
+                timeout=120,
+                env_overrides=identity_env,
+            ).stdout.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", commit_oid):
+            raise UploadError("无法固定隔离项目的 Git 提交；上传已停止。")
+        if created_commit:
+            parents = run_command(
+                _isolated_worktree_command(git_dir, path, "rev-list", "--parents", "-n", "1", commit_oid),
+                timeout=60,
+            ).stdout.strip().split()
+            expected = [commit_oid] + ([base_oid.lower()] if base_oid is not None else [])
+            if parents != expected:
+                raise UploadError("隔离提交的父提交与预检基准不一致；上传已停止。")
+        yield repository, commit_oid, created_commit, tree_oid
+
+
 def _gh_executable() -> str:
     candidates = [
         str(Path.home() / ".local" / "bin" / "gh"),
@@ -440,6 +717,27 @@ def _state_lock():
         yield
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@contextmanager
+def _project_execution_lock(project_id: str):
+    _ensure_state_dir()
+    lock_name = hashlib.sha256(project_id.encode()).hexdigest()
+    lock_path = STATE_DIR / f"execute-{lock_name}.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    locked = False
+    try:
+        os.chmod(lock_path, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except BlockingIOError as exc:
+            raise UploadError("这个项目已有上传正在执行；请等待其完成后重新预检。") from exc
+        yield
+    finally:
+        if locked:
+            fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
@@ -492,7 +790,10 @@ def _load_plans() -> dict[str, Any]:
 def _validate_project_path(raw_path: str) -> Path:
     if not raw_path.strip():
         raise UploadError("请提供项目目录路径。")
-    path = Path(raw_path).expanduser().resolve(strict=True)
+    expanded = Path(raw_path).expanduser()
+    if not expanded.is_absolute():
+        raise UploadError("请使用项目目录的绝对路径。")
+    path = expanded.resolve(strict=True)
     if not path.is_dir():
         raise UploadError("所选路径不是目录。")
     home = Path.home().resolve()
@@ -591,6 +892,13 @@ def _git_root(path: Path) -> Path | None:
         return Path(result.stdout.strip()).resolve()
     except OSError:
         return None
+
+
+def _ancestor_git_root(path: Path) -> Path | None:
+    for candidate in path.resolve().parents:
+        if _git_marker_kind(candidate) is not None:
+            return candidate
+    return None
 
 
 def _safe_remote_url(url: str) -> str:
@@ -703,23 +1011,62 @@ def _suggested_repo_name(path: Path) -> str:
     return (name or "project")[:100]
 
 
+def _effective_upload_mode(
+    item: dict[str, Any],
+    path: Path,
+    git_root: Path | None = None,
+) -> str:
+    stored = item.get("upload_mode")
+    if stored not in {None, UPLOAD_MODE_STANDARD, UPLOAD_MODE_ISOLATED_SUBDIRECTORY}:
+        raise UploadError("项目上传模式无效；请重新添加这个项目。")
+    if git_root is None and stored != UPLOAD_MODE_ISOLATED_SUBDIRECTORY:
+        if _git_marker_kind(path) is None and not _looks_like_bare_git_dir(path):
+            ancestor = _ancestor_git_root(path)
+            if ancestor is not None:
+                raise UploadError("项目在添加后进入了更大的 Git 仓库；请重新添加该目录以启用隔离子目录模式。")
+        git_root = _git_root(path)
+    if stored == UPLOAD_MODE_ISOLATED_SUBDIRECTORY:
+        if _git_marker_kind(path) is not None or _looks_like_bare_git_dir(path):
+            raise UploadError("这个隔离子目录现在包含自己的 Git 元数据；请重新添加项目以确认上传方式。")
+        return UPLOAD_MODE_ISOLATED_SUBDIRECTORY
+    if git_root is not None and git_root != path.resolve():
+        raise UploadError("项目在添加后进入了更大的 Git 仓库；请重新添加该目录以启用隔离子目录模式。")
+    return UPLOAD_MODE_STANDARD
+
+
 def register_project(path: str, display_name: str = "") -> dict[str, Any]:
     resolved = _validate_project_path(path)
-    git_root = _git_root(resolved)
-    if git_root is not None and git_root != resolved:
-        raise UploadError(f"该文件夹属于更大的 Git 项目。请注册项目根目录：{_redact_secret_text(str(git_root))}")
+    selected_marker = _git_marker_kind(resolved)
+    if selected_marker is not None or _looks_like_bare_git_dir(resolved):
+        git_root = _git_root(resolved)
+        upload_mode = UPLOAD_MODE_STANDARD
+    else:
+        ancestor_git_root = _ancestor_git_root(resolved)
+        git_root = ancestor_git_root or _git_root(resolved)
+        upload_mode = (
+            UPLOAD_MODE_ISOLATED_SUBDIRECTORY
+            if ancestor_git_root is not None
+            else UPLOAD_MODE_STANDARD
+        )
     with _state_lock():
         registry = _load_registry()
         for item in registry["projects"]:
             if Path(item["path"]).resolve() == resolved:
+                changed = item.get("upload_mode") != upload_mode
+                if changed and item.get("isolated_remote"):
+                    raise UploadError("这个项目已绑定隔离上传仓库，不能自动改变上传模式；请先保留当前目录结构。")
+                item["upload_mode"] = upload_mode
                 if display_name.strip():
                     item["name"] = display_name.strip()[:120]
+                    changed = True
+                if changed:
                     _write_json(REGISTRY_PATH, registry)
                 return {"registered": False, "project": _project_summary(item)}
         item = {
             "id": secrets.token_urlsafe(12),
             "name": (display_name.strip() or resolved.name)[:120],
             "path": str(resolved),
+            "upload_mode": upload_mode,
             "added_at": int(time.time()),
         }
         registry["projects"].append(item)
@@ -730,16 +1077,27 @@ def register_project(path: str, display_name: str = "") -> dict[str, Any]:
 def _project_summary(item: dict[str, Any]) -> dict[str, Any]:
     path = Path(item.get("path", ""))
     exists = path.is_dir()
-    git_root = _git_root(path) if exists else None
-    origin = _origin(path) if git_root == path.resolve() else None
-    branch = _branch(path) if git_root == path.resolve() else None
+    if exists and item.get("upload_mode") == UPLOAD_MODE_ISOLATED_SUBDIRECTORY:
+        git_root = _ancestor_git_root(path)
+    else:
+        git_root = _git_root(path) if exists else None
+    upload_mode = _effective_upload_mode(item, path, git_root) if exists else str(
+        item.get("upload_mode") or UPLOAD_MODE_STANDARD
+    )
+    is_isolated = upload_mode == UPLOAD_MODE_ISOLATED_SUBDIRECTORY
+    origin = _origin(path) if not is_isolated and git_root == path.resolve() else None
+    branch = _branch(path) if not is_isolated and git_root == path.resolve() else (
+        ISOLATED_SUBDIRECTORY_BRANCH if is_isolated else None
+    )
     return {
         "id": item.get("id"),
         "name": _redact_secret_text(str(item.get("name") or path.name)),
         "path": _redact_secret_text(str(path)),
         "exists": exists,
-        "is_git_repository": git_root == path.resolve() if exists else False,
+        "is_git_repository": (not is_isolated and git_root == path.resolve()) if exists else False,
         "inside_larger_repository": bool(git_root and git_root != path.resolve()) if exists else False,
+        "upload_mode": upload_mode,
+        "isolated_subdirectory": is_isolated,
         "branch": _redact_secret_text(branch) if branch else None,
         "origin": origin,
         "suggested_repo_name": _redact_secret_text(_suggested_repo_name(path)),
@@ -1217,6 +1575,11 @@ def _issue(severity: str, code: str, message: str, path: str | None = None, line
     return value
 
 
+def _is_credential_issue(issue: dict[str, Any]) -> bool:
+    code = str(issue.get("code", ""))
+    return any(code == rule or code.endswith(f"_{rule}") for rule in CREDENTIAL_ISSUE_RULES)
+
+
 def _scan_bytes(data: bytes, relative: str, source: str) -> list[dict[str, Any]]:
     text = data.decode("utf-8", errors="ignore")
     issues: list[dict[str, Any]] = []
@@ -1408,12 +1771,24 @@ def _local_git_config_issues(path: Path) -> tuple[list[dict[str, Any]], bool, bo
     return issues, partial_clone, risky_transport or risky_filter
 
 
-def _snapshot(path: Path, include_security_scan: bool = True) -> dict[str, Any]:
-    git_root = _git_root(path)
-    if git_root is not None and git_root != path:
-        raise UploadError(f"项目目录处于更大的 Git 仓库中：{_redact_secret_text(str(git_root))}")
-    is_git = git_root == path
+def _snapshot(
+    path: Path,
+    include_security_scan: bool = True,
+    upload_mode: str = UPLOAD_MODE_STANDARD,
+) -> dict[str, Any]:
+    if upload_mode not in {UPLOAD_MODE_STANDARD, UPLOAD_MODE_ISOLATED_SUBDIRECTORY}:
+        raise UploadError("项目上传模式无效；请重新添加这个项目。")
     marker_kind = _git_marker_kind(path)
+    if upload_mode == UPLOAD_MODE_ISOLATED_SUBDIRECTORY:
+        if marker_kind is not None or _looks_like_bare_git_dir(path):
+            raise UploadError("隔离子目录包含自己的 Git 元数据；请重新添加项目以确认上传方式。")
+        git_root = None
+        is_git = False
+    else:
+        git_root = _git_root(path)
+        if git_root is not None and git_root != path:
+            raise UploadError(f"项目目录处于更大的 Git 仓库中：{_redact_secret_text(str(git_root))}")
+        is_git = git_root == path
     head = _head(path) if is_git else None
     branch = _branch(path) if is_git else "main"
     origin = _origin(path) if is_git else None
@@ -1739,6 +2114,7 @@ def _snapshot(path: Path, include_security_scan: bool = True) -> dict[str, Any]:
     else:
         changes["untracked"] = len(files)
     content_fingerprint = digest.hexdigest()
+    digest.update(upload_mode.encode())
     digest.update(status.encode("utf-8", errors="replace"))
     digest.update((head or "").encode())
     digest.update((branch or "").encode())
@@ -1761,9 +2137,13 @@ def _snapshot(path: Path, include_security_scan: bool = True) -> dict[str, Any]:
             seen.add(key)
             unique.append(issue)
 
+    credential_issues = [issue for issue in unique if _is_credential_issue(issue)]
+    other_issues = [issue for issue in unique if not _is_credential_issue(issue)]
+
     return {
         "fingerprint": digest.hexdigest(),
         "content_fingerprint": content_fingerprint,
+        "upload_mode": upload_mode,
         "is_git_repository": is_git,
         "branch": branch,
         "head": head,
@@ -1775,10 +2155,57 @@ def _snapshot(path: Path, include_security_scan: bool = True) -> dict[str, Any]:
         "history_object_count": history_object_count,
         "issues": unique[:200],
         "issue_count": len(unique),
+        "credential_issue_count": len(credential_issues),
+        "credential_issues": credential_issues[:100],
+        "other_issues": other_issues[:100],
         "blocking_issue_count": sum(1 for issue in unique if issue["severity"] == "block"),
         "warning_count": sum(1 for issue in unique if issue["severity"] == "warn"),
         "changes": changes,
         "is_clean": status_ok and not bool(status),
+    }
+
+
+def self_check_project(project_id: str) -> dict[str, Any]:
+    item, path = _project_by_id(project_id)
+    upload_mode = _effective_upload_mode(item, path)
+    snapshot = _snapshot(path, include_security_scan=True, upload_mode=upload_mode)
+    return {
+        "project": {
+            "id": project_id,
+            "name": _redact_secret_text(str(item.get("name") or path.name)),
+            "path": _redact_secret_text(str(path)),
+            "upload_mode": upload_mode,
+            "isolated_subdirectory": upload_mode == UPLOAD_MODE_ISOLATED_SUBDIRECTORY,
+        },
+        "files": {
+            "count": snapshot["file_count"],
+            "total_bytes": snapshot["total_bytes"],
+            "history_blob_count": snapshot["history_blob_count"],
+        },
+        "credential_issue_count": snapshot["credential_issue_count"],
+        "credential_findings": snapshot["credential_issues"],
+        "other_issue_count": snapshot["issue_count"] - snapshot["credential_issue_count"],
+        "other_issues": snapshot["other_issues"],
+        "blocking_issue_count": snapshot["blocking_issue_count"],
+        "warning_count": snapshot["warning_count"],
+    }
+
+
+def _validated_repo_payload(value: Any, owner: str, repo: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or not value.get("full_name") or not value.get("html_url"):
+        raise UploadError("GitHub 返回的仓库信息不完整；请稍后重试。")
+    expected = f"{owner}/{repo}".lower()
+    html_url = str(value["html_url"])
+    parsed_url = urlsplit(html_url)
+    if str(value["full_name"]).lower() != expected:
+        raise UploadError("GitHub 返回的仓库身份与请求目标不一致；请稍后重试。")
+    if parsed_url.scheme != "https" or parsed_url.hostname != "github.com":
+        raise UploadError("GitHub 返回的仓库链接无效；请稍后重试。")
+    return {
+        "nameWithOwner": value["full_name"],
+        "visibility": value.get("visibility") or ("private" if value.get("private") else "public"),
+        "url": html_url,
+        "id": value.get("id") if type(value.get("id")) is int and value.get("id") > 0 else None,
     }
 
 
@@ -1797,20 +2224,33 @@ def _repo_view(owner: str, repo: str) -> dict[str, Any] | None:
         value = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise UploadError("GitHub 返回了无法解析的仓库信息；请稍后重试。") from exc
-    if not isinstance(value, dict) or not value.get("full_name") or not value.get("html_url"):
-        raise UploadError("GitHub 返回的仓库信息不完整；请稍后重试。")
-    expected = f"{owner}/{repo}".lower()
-    html_url = str(value["html_url"])
-    parsed_url = urlsplit(html_url)
-    if str(value["full_name"]).lower() != expected:
-        raise UploadError("GitHub 返回的仓库身份与请求目标不一致；请稍后重试。")
-    if parsed_url.scheme != "https" or parsed_url.hostname != "github.com":
-        raise UploadError("GitHub 返回的仓库链接无效；请稍后重试。")
-    return {
-        "nameWithOwner": value["full_name"],
-        "visibility": value.get("visibility") or ("private" if value.get("private") else "public"),
-        "url": html_url,
-    }
+    return _validated_repo_payload(value, owner, repo)
+
+
+def _create_repository(owner: str, repo: str, visibility: str) -> dict[str, Any]:
+    request = json.dumps(
+        {"name": repo, "private": visibility == "private"},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    result = run_command(
+        [_gh_executable(), "api", "--method", "POST", "user/repos", "--input", "-"],
+        input_text=request,
+        check=False,
+        timeout=180,
+    )
+    if result.returncode != 0:
+        raise UploadError(f"无法创建 GitHub 仓库：{_safe_error(result.stderr or result.stdout)}")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise UploadError("GitHub 创建仓库后返回了无法解析的信息；未执行推送。") from exc
+    created = _validated_repo_payload(value, owner, repo)
+    if created.get("id") is None:
+        raise UploadError("无法从 GitHub 创建响应中固定仓库身份；未执行推送。")
+    if str(created.get("visibility", "")).lower() != visibility:
+        raise UploadError("新建 GitHub 仓库的实际可见性与计划不一致；未执行推送。")
+    return created
 
 
 def _remote_alignment_issues(origin: str | None, push_urls: list[str], target_slug: str) -> list[dict[str, Any]]:
@@ -1847,20 +2287,223 @@ def _remote_alignment_issues(origin: str | None, push_urls: list[str], target_sl
     return issues
 
 
+def _isolated_remote_binding(item: dict[str, Any]) -> dict[str, Any] | None:
+    raw = item.get("isolated_remote")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise UploadError("隔离项目的远程绑定状态无效；上传已停止。")
+    target = raw.get("target")
+    visibility = raw.get("visibility")
+    branch = raw.get("branch")
+    repository_id = raw.get("repository_id")
+    if (
+        not isinstance(target, str)
+        or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}", target)
+        or visibility not in {"private", "public"}
+        or branch != ISOLATED_SUBDIRECTORY_BRANCH
+        or (repository_id is not None and (type(repository_id) is not int or repository_id <= 0))
+    ):
+        raise UploadError("隔离项目的远程绑定状态无效；上传已停止。")
+    binding = {
+        "target": target,
+        "visibility": visibility,
+        "branch": branch,
+        "repository_id": repository_id,
+    }
+    for key in ("last_commit_oid", "pending_commit_oid"):
+        oid = raw.get(key)
+        if oid is not None and (not isinstance(oid, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", oid)):
+            raise UploadError("隔离项目的远程提交绑定无效；上传已停止。")
+        binding[key] = oid.lower() if oid else None
+    return binding
+
+
+def _isolated_binding_fingerprint(binding: dict[str, Any] | None) -> str:
+    canonical = json.dumps(binding, sort_keys=True, separators=(",", ":")) if binding else ""
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _write_isolated_binding(
+    project_id: str,
+    *,
+    target: str,
+    visibility: str,
+    repository_id: int | None,
+    last_commit_oid: str | None,
+    pending_commit_oid: str | None,
+    expected_binding_fingerprint: str,
+    repository_url: str | None = None,
+) -> str:
+    binding = {
+        "target": target,
+        "visibility": visibility,
+        "branch": ISOLATED_SUBDIRECTORY_BRANCH,
+        "repository_id": repository_id,
+        "last_commit_oid": last_commit_oid,
+        "pending_commit_oid": pending_commit_oid,
+    }
+    _isolated_remote_binding({"isolated_remote": binding})
+    with _state_lock():
+        registry = _load_registry()
+        entry = next((candidate for candidate in registry["projects"] if candidate.get("id") == project_id), None)
+        if entry is None:
+            raise UploadError("项目注册信息在上传期间消失；上传已停止。")
+        if entry.get("upload_mode") != UPLOAD_MODE_ISOLATED_SUBDIRECTORY:
+            raise UploadError("项目上传模式在执行期间发生变化；上传已停止。")
+        current_binding = _isolated_remote_binding(entry)
+        if _isolated_binding_fingerprint(current_binding) != expected_binding_fingerprint:
+            raise UploadError("项目远程绑定在执行期间发生变化；上传已停止。")
+        entry["isolated_remote"] = binding
+        if repository_url is not None:
+            entry["last_upload_url"] = repository_url
+            entry["last_upload_at"] = int(time.time())
+        _write_json(REGISTRY_PATH, registry)
+    return _isolated_binding_fingerprint(binding)
+
+
+def _isolated_target_state(
+    item: dict[str, Any],
+    target_slug: str,
+    visibility: str,
+    target: dict[str, Any] | None,
+) -> tuple[str | None, list[dict[str, Any]], dict[str, Any] | None]:
+    issues: list[dict[str, Any]] = []
+    binding = _isolated_remote_binding(item)
+    if binding is not None and binding["target"].lower() != target_slug.lower():
+        issues.append(
+            _issue(
+                "block",
+                "isolated_target_conflict",
+                f"这个隔离子目录已绑定到 {binding['target']}；插件不会静默改绑其他仓库。",
+            )
+        )
+    if binding is not None and binding["visibility"] != visibility:
+        issues.append(
+            _issue(
+                "block",
+                "isolated_visibility_conflict",
+                "隔离子目录的已绑定可见性与本次计划不一致。",
+            )
+        )
+    if issues:
+        return None, issues, binding
+    if target is None:
+        if binding is not None and (
+            binding.get("repository_id") is not None or binding.get("last_commit_oid") is not None
+        ):
+            issues.append(
+                _issue(
+                    "block",
+                    "isolated_target_missing",
+                    "已绑定的 GitHub 仓库不再存在；插件不会用同名新仓库替代它。",
+                )
+            )
+        return None, issues, binding
+    if binding is None:
+        issues.append(
+            _issue(
+                "block",
+                "target_exists",
+                f"GitHub 上已存在 {target_slug}，但这个隔离子目录尚未与它绑定。",
+            )
+        )
+        return None, issues, None
+    target_id = target.get("id")
+    if type(target_id) is not int or target_id <= 0:
+        issues.append(_issue("block", "unknown_repository_identity", "无法确认现有 GitHub 仓库的固定身份。"))
+        return None, issues, binding
+    if binding.get("repository_id") is None:
+        issues.append(
+            _issue(
+                "block",
+                "unbound_repository_identity",
+                "仓库已创建，但本地没有完成固定身份绑定；为避免接管同名仓库，上传已停止。",
+            )
+        )
+        return None, issues, binding
+    if binding["repository_id"] != target_id:
+        issues.append(
+            _issue(
+                "block",
+                "repository_identity_changed",
+                "同名 GitHub 仓库的固定身份已变化；插件不会把它当作原仓库继续上传。",
+            )
+        )
+        return None, issues, binding
+    remote_url = f"git@github.com:{target_slug}.git"
+    remote_oid = _isolated_remote_branch_oid(remote_url, ISOLATED_SUBDIRECTORY_BRANCH)
+    if remote_oid is None:
+        if binding.get("last_commit_oid") is not None:
+            issues.append(_issue("block", "remote_branch_missing", "已绑定仓库的 main 分支不再存在；上传已停止。"))
+        return None, issues, binding
+    accepted = {binding.get("last_commit_oid"), binding.get("pending_commit_oid")}
+    accepted.discard(None)
+    if remote_oid not in accepted:
+        issues.append(
+            _issue(
+                "block",
+                "remote_branch_changed",
+                "GitHub main 分支已在插件之外发生变化；请先人工核对，插件不会强制覆盖。",
+            )
+        )
+        return None, issues, binding
+    return remote_oid, issues, binding
+
+
 def preflight_upload(project_id: str, repo_name: str, visibility: str = "private") -> dict[str, Any]:
     item, path = _project_by_id(project_id)
+    upload_mode = _effective_upload_mode(item, path)
+    isolated = upload_mode == UPLOAD_MODE_ISOLATED_SUBDIRECTORY
     repo = _validate_repo_name(repo_name)
     visibility = visibility.strip().lower()
     if visibility not in {"private", "public"}:
         raise UploadError("仓库可见性只能是 private 或 public。")
     owner = github_owner()
-    snapshot = _snapshot(path, include_security_scan=True)
+    snapshot = _snapshot(path, include_security_scan=True, upload_mode=upload_mode)
     target_slug = f"{owner}/{repo}"
     origin_slug = _github_slug_from_remote(snapshot.get("origin") or "")
     target = _repo_view(owner, repo)
     issues = list(snapshot["issues"])
-    issues.extend(_remote_alignment_issues(snapshot.get("origin"), snapshot.get("push_urls", []), target_slug))
+    base_oid: str | None = None
+    binding = _isolated_remote_binding(item) if isolated else None
+    if isolated:
+        base_oid, isolated_issues, binding = _isolated_target_state(item, target_slug, visibility, target)
+        issues.extend(isolated_issues)
+    else:
+        issues.extend(_remote_alignment_issues(snapshot.get("origin"), snapshot.get("push_urls", []), target_slug))
     actual_visibility = str(target.get("visibility", "")).lower() if target else None
+    isolated_tree_oid: str | None = None
+    if isolated and not snapshot["blocking_issue_count"] and not (snapshot["file_count"] == 0 and base_oid is None):
+        try:
+            with _isolated_snapshot_repository(
+                path,
+                owner,
+                f"git@github.com:{target_slug}.git",
+                None,
+            ) as (_, _, _, tree_oid):
+                isolated_tree_oid = tree_oid
+                verified_snapshot = _snapshot(
+                    path,
+                    include_security_scan=True,
+                    upload_mode=UPLOAD_MODE_ISOLATED_SUBDIRECTORY,
+                )
+            if verified_snapshot["fingerprint"] != snapshot["fingerprint"]:
+                issues.append(
+                    _issue(
+                        "block",
+                        "project_changed_during_isolated_tree",
+                        "项目在固定隔离快照文件树期间发生变化；请重新预检。",
+                    )
+                )
+        except UploadError as exc:
+            issues.append(
+                _issue(
+                    "block",
+                    "isolated_tree_unverifiable",
+                    _safe_error(str(exc)) or "无法固定隔离快照文件树；上传已停止。",
+                )
+            )
 
     if snapshot["is_git_repository"] and snapshot["branch"] is None:
         issues.append(_issue("block", "detached_head", "当前仓库处于 detached HEAD；请先切换或创建分支。"))
@@ -1874,9 +2517,9 @@ def preflight_upload(project_id: str, repo_name: str, visibility: str = "private
                 f"（暂存 {counts['staged']}、未暂存 {counts['unstaged']}、未跟踪 {counts['untracked']}）。",
             )
         )
-    if snapshot["head"] is None and snapshot["file_count"] == 0:
+    if snapshot["head"] is None and snapshot["file_count"] == 0 and (not isolated or base_oid is None):
         issues.append(_issue("block", "empty_project", "项目没有可提交的文件。"))
-    if target is not None and origin_slug != target_slug.lower():
+    if not isolated and target is not None and origin_slug != target_slug.lower():
         issues.append(_issue("block", "target_exists", f"GitHub 上已存在 {target_slug}，但本地 origin 未与它绑定。"))
     if target is not None and actual_visibility not in {"private", "public"}:
         issues.append(_issue("block", "unknown_target_visibility", "无法确认现有 GitHub 仓库的实际可见性。"))
@@ -1903,6 +2546,10 @@ def preflight_upload(project_id: str, repo_name: str, visibility: str = "private
         "repo_name": repo,
         "target": target_slug,
         "visibility": visibility,
+        "upload_mode": upload_mode,
+        "isolated_binding_fingerprint": _isolated_binding_fingerprint(binding),
+        "base_oid": base_oid,
+        "isolated_tree_oid": isolated_tree_oid,
         "fingerprint": snapshot["fingerprint"],
         "content_fingerprint": snapshot["content_fingerprint"],
         "head": snapshot["head"],
@@ -1925,6 +2572,8 @@ def preflight_upload(project_id: str, repo_name: str, visibility: str = "private
             "id": project_id,
             "name": _redact_secret_text(str(plan["project_name"])),
             "path": _redact_secret_text(str(path)),
+            "upload_mode": upload_mode,
+            "isolated_subdirectory": isolated,
         },
         "repository": {
             "owner": owner,
@@ -1932,6 +2581,7 @@ def preflight_upload(project_id: str, repo_name: str, visibility: str = "private
             "name_with_owner": target_slug,
             "visibility": visibility,
             "actual_visibility": actual_visibility,
+            "repository_id": target.get("id") if target else None,
             "already_exists": target is not None,
             "url": target.get("url") if target else f"https://github.com/{target_slug}",
         },
@@ -1941,6 +2591,8 @@ def preflight_upload(project_id: str, repo_name: str, visibility: str = "private
             "head": snapshot["head"],
             "origin": snapshot["origin"],
             "push_urls": snapshot["push_urls"],
+            "upload_mode": upload_mode,
+            "remote_base_oid": base_oid,
         },
         "files": {
             "count": snapshot["file_count"],
@@ -1987,13 +2639,165 @@ def _claim_plan(plan_id: str) -> None:
         _write_json(PLANS_PATH, plans)
 
 
-def execute_upload(plan_id: str, confirm_public_repository: str = "") -> dict[str, Any]:
+def _execute_isolated_upload(
+    plan: dict[str, Any],
+    item: dict[str, Any],
+    path: Path,
+    target: dict[str, Any] | None,
+) -> dict[str, Any]:
+    owner = str(plan["owner"])
+    repo = str(plan["repo_name"])
+    target_slug = str(plan["target"])
+    visibility = str(plan["visibility"])
+    base_oid = plan.get("base_oid")
+    safe_push_url = f"git@github.com:{owner}/{repo}.git"
+    binding = _isolated_remote_binding(item)
+    repository_id = binding.get("repository_id") if binding else None
+    created = False
+    expected_binding_fingerprint = str(plan["isolated_binding_fingerprint"])
+
+    with _isolated_snapshot_repository(path, owner, safe_push_url, base_oid) as (
+        snapshot_repository,
+        push_oid,
+        committed,
+        tree_oid,
+    ):
+        if tree_oid != plan.get("isolated_tree_oid"):
+            raise UploadError("隔离提交的文件树与预检结果不一致；未创建 GitHub 仓库。")
+        after_build = _snapshot(
+            path,
+            include_security_scan=True,
+            upload_mode=UPLOAD_MODE_ISOLATED_SUBDIRECTORY,
+        )
+        if (
+            after_build["fingerprint"] != plan.get("fingerprint")
+            or after_build["content_fingerprint"] != plan.get("content_fingerprint")
+            or after_build["blocking_issue_count"]
+        ):
+            raise UploadError("隔离提交生成期间项目内容发生变化；未创建 GitHub 仓库。")
+
+        expected_binding_fingerprint = _write_isolated_binding(
+            str(item["id"]),
+            target=target_slug,
+            visibility=visibility,
+            repository_id=repository_id,
+            last_commit_oid=base_oid,
+            pending_commit_oid=push_oid,
+            expected_binding_fingerprint=expected_binding_fingerprint,
+        )
+        if target is None:
+            created_target = _create_repository(owner, repo, visibility)
+            created = True
+            repository_id = created_target["id"]
+
+        verified_target = _repo_view(owner, repo)
+        if verified_target is None:
+            raise UploadError("无法确认 GitHub 目标仓库；未执行推送。")
+        if str(verified_target.get("visibility", "")).lower() != visibility:
+            raise UploadError("目标仓库的实际可见性已变化；未执行推送。")
+        verified_repository_id = verified_target.get("id")
+        if type(verified_repository_id) is not int or verified_repository_id <= 0:
+            raise UploadError("无法固定 GitHub 仓库身份；未执行推送。")
+        if repository_id is not None and verified_repository_id != repository_id:
+            raise UploadError("同名 GitHub 仓库的固定身份已变化；未执行推送。")
+
+        expected_binding_fingerprint = _write_isolated_binding(
+            str(item["id"]),
+            target=target_slug,
+            visibility=visibility,
+            repository_id=verified_repository_id,
+            last_commit_oid=base_oid,
+            pending_commit_oid=push_oid,
+            expected_binding_fingerprint=expected_binding_fingerprint,
+        )
+
+        before_push = _snapshot(
+            path,
+            include_security_scan=True,
+            upload_mode=UPLOAD_MODE_ISOLATED_SUBDIRECTORY,
+        )
+        if before_push["fingerprint"] != plan.get("fingerprint") or before_push["blocking_issue_count"]:
+            raise UploadError("隔离项目在推送前发生变化；请重新预检。")
+        remote_before_push = _isolated_remote_branch_oid(safe_push_url, ISOLATED_SUBDIRECTORY_BRANCH)
+        if remote_before_push != base_oid:
+            raise UploadError("GitHub main 分支在确认后发生变化；未执行推送。")
+        target_immediately_before_push = _repo_view(owner, repo)
+        if target_immediately_before_push is None:
+            raise UploadError("GitHub 目标仓库在推送前消失；未执行推送。")
+        if str(target_immediately_before_push.get("visibility", "")).lower() != visibility:
+            raise UploadError("目标仓库的实际可见性在推送前发生变化；未执行推送。")
+        if target_immediately_before_push.get("id") != verified_repository_id:
+            raise UploadError("同名 GitHub 仓库的固定身份在推送前发生变化；未执行推送。")
+        with _isolated_push_repository(snapshot_repository, push_oid) as (
+            transport_root,
+            transport_git_dir,
+            transport_env,
+        ):
+            run_command(
+                _git_push_command(
+                    transport_git_dir,
+                    safe_push_url,
+                    push_oid,
+                    ISOLATED_SUBDIRECTORY_BRANCH,
+                ),
+                timeout=1800,
+                env_overrides=transport_env,
+            )
+            _verify_remote_branch(
+                transport_root,
+                safe_push_url,
+                push_oid,
+                ISOLATED_SUBDIRECTORY_BRANCH,
+            )
+
+        target_after_push = _repo_view(owner, repo)
+        if (
+            target_after_push is None
+            or target_after_push.get("id") != verified_repository_id
+            or str(target_after_push.get("visibility", "")).lower() != visibility
+        ):
+            raise UploadError(
+                "推送后无法确认目标仍是原 GitHub 仓库；不会报告成功，请人工核对同名仓库。"
+            )
+
+        url = str(target_after_push["url"])
+        _write_isolated_binding(
+            str(item["id"]),
+            target=target_slug,
+            visibility=visibility,
+            repository_id=verified_repository_id,
+            last_commit_oid=push_oid,
+            pending_commit_oid=None,
+            expected_binding_fingerprint=expected_binding_fingerprint,
+            repository_url=url,
+        )
+        return {
+            "uploaded": True,
+            "created_repository": created,
+            "created_commit": committed,
+            "repository": target_slug,
+            "repository_url": url,
+            "visibility": visibility,
+            "branch": ISOLATED_SUBDIRECTORY_BRANCH,
+            "commit_oid": push_oid,
+            "upload_mode": UPLOAD_MODE_ISOLATED_SUBDIRECTORY,
+        }
+
+
+def _execute_upload_locked(plan_id: str, confirm_public_repository: str = "") -> dict[str, Any]:
     plan = _read_plan(plan_id)
     if plan.get("visibility") == "public" and confirm_public_repository != plan.get("target"):
         raise UploadError(f"公开上传需要再次输入完整仓库名：{plan.get('target')}")
 
     item, path = _project_by_id(str(plan.get("project_id", "")))
-    current = _snapshot(path, include_security_scan=True)
+    upload_mode = _effective_upload_mode(item, path)
+    if upload_mode != plan.get("upload_mode"):
+        raise UploadError("项目上传模式在预检后发生变化；请重新预检。")
+    isolated = upload_mode == UPLOAD_MODE_ISOLATED_SUBDIRECTORY
+    binding = _isolated_remote_binding(item) if isolated else None
+    if _isolated_binding_fingerprint(binding) != plan.get("isolated_binding_fingerprint"):
+        raise UploadError("项目远程绑定在预检后发生变化；请重新预检。")
+    current = _snapshot(path, include_security_scan=True, upload_mode=upload_mode)
     if current["fingerprint"] != plan.get("fingerprint"):
         raise UploadError("项目内容或 Git 状态在预检后发生了变化；请重新预检。")
     if current["blocking_issue_count"]:
@@ -2008,18 +2812,33 @@ def execute_upload(plan_id: str, confirm_public_repository: str = "") -> dict[st
         raise UploadError("上传目标与预检计划不一致；请重新预检。")
     origin = current.get("origin")
     origin_slug = _github_slug_from_remote(origin or "")
-    remote_issues = _remote_alignment_issues(origin, current.get("push_urls", []), target_slug)
-    if remote_issues:
-        raise UploadError(remote_issues[0]["message"])
     target = _repo_view(owner, repo)
-    if target is not None and origin_slug != target_slug.lower():
-        raise UploadError("目标仓库已存在但未与本地 origin 绑定；请重新确认仓库。")
+    if isolated:
+        base_oid, isolated_issues, _ = _isolated_target_state(item, target_slug, str(plan.get("visibility")), target)
+        if isolated_issues:
+            raise UploadError(isolated_issues[0]["message"])
+        if base_oid != plan.get("base_oid"):
+            raise UploadError("GitHub main 分支在预检后发生变化；请重新预检。")
+    else:
+        remote_issues = _remote_alignment_issues(origin, current.get("push_urls", []), target_slug)
+        if remote_issues:
+            raise UploadError(remote_issues[0]["message"])
+        if target is not None and origin_slug != target_slug.lower():
+            raise UploadError("目标仓库已存在但未与本地 origin 绑定；请重新确认仓库。")
     if target is not None and str(target.get("visibility", "")).lower() != plan.get("visibility"):
         raise UploadError("目标仓库的实际可见性与预检计划不一致；请重新预检。")
 
     _claim_plan(plan_id)
     if os.environ.get("UPLOAD_DRY_RUN") == "1":
-        return {"uploaded": False, "dry_run": True, "repository_url": f"https://github.com/{target_slug}"}
+        return {
+            "uploaded": False,
+            "dry_run": True,
+            "repository_url": f"https://github.com/{target_slug}",
+            "upload_mode": upload_mode,
+        }
+
+    if isolated:
+        return _execute_isolated_upload(plan, item, path, target)
 
     gh = _gh_executable()
     if not current["is_git_repository"]:
@@ -2151,7 +2970,17 @@ def execute_upload(plan_id: str, confirm_public_repository: str = "") -> dict[st
         "visibility": plan.get("visibility"),
         "branch": _redact_secret_text(validated_branch),
         "commit_oid": push_oid,
+        "upload_mode": upload_mode,
     }
+
+
+def execute_upload(plan_id: str, confirm_public_repository: str = "") -> dict[str, Any]:
+    plan = _read_plan(plan_id)
+    project_id = plan.get("project_id")
+    if not isinstance(project_id, str) or not project_id:
+        raise UploadError("上传计划缺少有效项目；请重新预检。")
+    with _project_execution_lock(project_id):
+        return _execute_upload_locked(plan_id, confirm_public_repository)
 
 
 def seed_projects(paths: Iterable[str]) -> dict[str, Any]:

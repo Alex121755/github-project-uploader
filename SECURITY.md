@@ -31,6 +31,7 @@ High-priority reports include:
 - Secret values returned to the model/UI or written into plugin state.
 - Execution of project-controlled Git filters, hooks, helpers, or transport rewrites during preflight or push.
 - A race that changes the reviewed commit or selected content before upload.
+- An isolated-subdirectory upload that reads parent-repository content/history or modifies the parent repository, its index/config/remotes, or the selected directory's Git metadata.
+- Bypassing the isolated binding to adopt a same-name repository with a different immutable GitHub repository ID or remote `main` OID.
 
 Heuristic false negatives in secret detection are valuable reports, but the scanner is defense in depth and cannot guarantee that all sensitive data is found.
-

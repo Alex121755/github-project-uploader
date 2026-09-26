@@ -86,7 +86,7 @@
     <header>
       <div>
         <h1>GitHub 项目上传器</h1>
-        <div class="sub">选择项目，预检后上传为私有仓库</div>
+        <div class="sub">选择项目，先自检敏感信息，再按需准备上传</div>
       </div>
       <div id="account" class="account">正在连接…</div>
     </header>
@@ -104,8 +104,10 @@
         <div class="meta"><span class="tag private">默认私有</span><span class="tag">不会强制推送</span></div>
         <div class="actions">
           <button id="refreshButton" type="button">刷新</button>
+          <button id="selfCheckButton" type="button" disabled>敏感信息自检</button>
           <button id="preflightButton" type="button" class="primary" disabled>检查并准备上传</button>
         </div>
+        <div class="sub" style="text-align:right;margin-top:5px">自检只需选中项目，无需填写仓库名或登录 GitHub。</div>
       </section>
 
       <details>
@@ -115,10 +117,11 @@
           <input id="displayName" type="text" placeholder="显示名称（可选）" />
           <button id="addButton" type="button">添加</button>
         </div>
-        <div class="sub" style="margin-top:7px">请选择具体项目根目录，不要填写整个“文稿”或用户主目录。</div>
+        <div class="sub" style="margin-top:7px">请选择具体项目目录；它可以位于更大的 Git 仓库中，此时会作为独立快照上传。不要填写整个“文稿”或用户主目录。</div>
       </details>
     </div>
 
+    <div id="selfCheckView" class="hidden"></div>
     <div id="preflightView" class="hidden"></div>
     <div id="completeView" class="hidden"></div>
   </main>
@@ -131,6 +134,7 @@
 
       const el = (id) => document.getElementById(id);
       const projectView = el("projectView");
+      const selfCheckView = el("selfCheckView");
       const preflightView = el("preflightView");
       const completeView = el("completeView");
 
@@ -176,8 +180,11 @@
 
       function setBusy(value, label) {
         state.busy = value;
-        [el("refreshButton"), el("preflightButton"), el("addButton")].forEach((button) => {
-          if (button) button.disabled = value || (button.id === "preflightButton" && !state.selectedId);
+        [el("refreshButton"), el("selfCheckButton"), el("preflightButton"), el("addButton")].forEach((button) => {
+          if (button) button.disabled = value || (
+            (button.id === "selfCheckButton" && !state.selectedId)
+            || (button.id === "preflightButton" && (!state.selectedId || !state.data?.github?.connected))
+          );
         });
         if (label) showNotice(label);
       }
@@ -201,6 +208,7 @@
         state.data = data;
         state.plan = null;
         projectView.classList.remove("hidden");
+        selfCheckView.classList.add("hidden");
         preflightView.classList.add("hidden");
         completeView.classList.add("hidden");
 
@@ -215,6 +223,7 @@
         if (!projects.length) {
           container.append(textNode("div", "notice", "还没有项目。展开下方“添加新的本地项目”，填写项目路径。"));
           state.selectedId = null;
+          el("selfCheckButton").disabled = true;
           el("preflightButton").disabled = true;
           return;
         }
@@ -229,16 +238,22 @@
           radio.name = "project";
           radio.value = project.id;
           radio.checked = project.id === state.selectedId;
-          radio.disabled = !project.exists || project.inside_larger_repository;
+          radio.disabled = !project.exists;
           const body = document.createElement("div");
           body.append(textNode("div", "project-name", project.name || "未命名项目"));
           body.append(textNode("div", "path", project.path || ""));
           const meta = document.createElement("div");
           meta.className = "meta";
-          meta.append(textNode("span", "tag", project.is_git_repository ? `Git · ${project.branch || "无分支"}` : "将初始化 Git"));
+          meta.append(textNode(
+            "span",
+            "tag",
+            project.isolated_subdirectory
+              ? "独立子目录 · main"
+              : (project.is_git_repository ? `Git · ${project.branch || "无分支"}` : "将初始化 Git"),
+          ));
           if (project.origin) meta.append(textNode("span", "tag", "已有 origin"));
           if (!project.exists) meta.append(textNode("span", "tag", "路径不存在"));
-          if (project.inside_larger_repository) meta.append(textNode("span", "tag", "请选择仓库根目录"));
+          if (project.isolated_subdirectory) meta.append(textNode("span", "tag", "不含父仓库历史"));
           body.append(meta);
           card.append(radio, body);
           card.addEventListener("change", () => {
@@ -249,6 +264,7 @@
           });
           container.append(card);
         }
+        el("selfCheckButton").disabled = state.busy || !state.selectedId;
         el("preflightButton").disabled = state.busy || !state.selectedId || !github.connected;
       }
 
@@ -259,9 +275,64 @@
         parent.append(node);
       }
 
+      function renderSelfCheck(report) {
+        state.plan = null;
+        projectView.classList.add("hidden");
+        preflightView.classList.add("hidden");
+        completeView.classList.add("hidden");
+        selfCheckView.classList.remove("hidden");
+        selfCheckView.replaceChildren();
+
+        const card = document.createElement("div");
+        card.className = "summary-card";
+        card.append(textNode("div", "summary-title", `${report.project?.name || "项目"} · 敏感信息自检`));
+        card.append(textNode("div", "sub", report.project?.isolated_subdirectory
+          ? "仅检查所选目录的拟上传内容；不包含父仓库历史。"
+          : "检查拟上传文件；已有 Git 仓库还会检查历史。"));
+        const stats = document.createElement("div");
+        stats.className = "stats";
+        addStat(stats, String(report.files?.count ?? 0), "文件");
+        addStat(stats, String(report.credential_issue_count ?? 0), "疑似凭据");
+        addStat(stats, String(report.other_issue_count ?? 0), "其他问题");
+        card.append(stats);
+        card.append(textNode("div", "notice", "自检结果只显示规则、文件和行号，不显示密钥值。未发现匹配项也不能证明项目没有泄漏；实际上传前仍会重新预检。"));
+
+        const groups = [
+          ["疑似凭据", report.credential_findings, report.credential_issue_count],
+          ["其他上传问题", report.other_issues, report.other_issue_count],
+        ];
+        for (const [title, findings, count] of groups) {
+          const heading = textNode("div", "project-name", `${title}（${count ?? 0}）`);
+          heading.style.marginTop = "12px";
+          card.append(heading);
+          const list = document.createElement("div");
+          list.className = "issues";
+          const visible = Array.isArray(findings) ? findings : [];
+          if (!visible.length) list.append(textNode("div", "notice", "本次未发现。"));
+          for (const issue of visible) {
+            const row = textNode("div", `issue ${issue.severity}`, `${issue.severity === "block" ? "阻止" : "注意"}：${issue.message}`);
+            if (issue.path) row.append(textNode("span", "issue-path", `${issue.path}${issue.line ? `:${issue.line}` : ""}`));
+            list.append(row);
+          }
+          if ((count ?? 0) > visible.length) {
+            list.append(textNode("div", "notice", `还有 ${(count ?? 0) - visible.length} 项未在卡片中展开；请缩小项目范围后重查。`));
+          }
+          card.append(list);
+        }
+        selfCheckView.append(card);
+        const actions = document.createElement("div");
+        actions.className = "actions";
+        const back = textNode("button", "", "返回项目列表");
+        back.type = "button";
+        back.onclick = () => { showNotice(""); if (state.data) renderProjects(state.data); else void refresh(); };
+        actions.append(back);
+        selfCheckView.append(actions);
+      }
+
       function renderPreflight(plan) {
         state.plan = plan;
         projectView.classList.add("hidden");
+        selfCheckView.classList.add("hidden");
         completeView.classList.add("hidden");
         preflightView.classList.remove("hidden");
         preflightView.replaceChildren();
@@ -269,13 +340,19 @@
         const card = document.createElement("div");
         card.className = "summary-card";
         card.append(textNode("div", "summary-title", plan.repository?.name_with_owner || "上传计划"));
-        card.append(textNode("div", "sub", `${plan.project?.name || "项目"} · ${plan.repository?.visibility === "private" ? "私有仓库" : "公开仓库"}`));
+        const projectMode = plan.project?.isolated_subdirectory
+          ? "独立子目录快照"
+          : (plan.git?.is_git_repository ? "本地 Git 项目" : "普通目录 · 将初始化 Git");
+        card.append(textNode("div", "sub", `${plan.project?.name || "项目"} · ${projectMode} · ${plan.repository?.visibility === "private" ? "私有仓库" : "公开仓库"}`));
         const stats = document.createElement("div");
         stats.className = "stats";
         addStat(stats, String(plan.files?.count ?? 0), "文件");
         addStat(stats, formatBytes(plan.files?.total_bytes), "当前内容");
         addStat(stats, String(plan.warning_count ?? 0), "警告");
         card.append(stats);
+        if (plan.project?.isolated_subdirectory) {
+          card.append(textNode("div", "notice", "只上传所选目录；不会读取或修改父仓库的历史、origin 和暂存区。"));
+        }
 
         const issues = document.createElement("div");
         issues.className = "issues";
@@ -329,14 +406,23 @@
 
       function renderComplete(result) {
         projectView.classList.add("hidden");
+        selfCheckView.classList.add("hidden");
         preflightView.classList.add("hidden");
         completeView.classList.remove("hidden");
         completeView.replaceChildren();
         const box = document.createElement("div");
         box.className = "complete";
         const isDryRun = result?.dry_run === true || result?.uploaded === false;
+        const isUnchanged = !isDryRun
+          && result?.upload_mode === "isolated_subdirectory"
+          && result?.created_repository === false
+          && result?.created_commit === false;
         box.append(textNode("div", "check", isDryRun ? "i" : "✓"));
-        box.append(textNode("div", "summary-title", isDryRun ? "测试模式完成，未上传" : "项目已上传"));
+        box.append(textNode(
+          "div",
+          "summary-title",
+          isDryRun ? "测试模式完成，未上传" : (isUnchanged ? "远程项目已是最新" : "项目已上传"),
+        ));
         box.append(textNode(
           "div",
           "sub",
@@ -383,13 +469,30 @@
       }
 
       el("refreshButton").onclick = refresh;
+      el("selfCheckButton").onclick = async () => {
+        if (!state.selectedId) {
+          showNotice("请先选择项目。", "error");
+          return;
+        }
+        setBusy(true, "正在本机检查拟上传文件和 Git 历史中的敏感信息…");
+        try {
+          const report = await callTool("self_check_project", { project_id: state.selectedId }, 600000);
+          if (!report?.ok) throw new Error(report?.error || "自检失败");
+          showNotice("");
+          renderSelfCheck(report);
+        } catch (error) {
+          showNotice(error?.message || String(error), "error");
+        } finally {
+          setBusy(false);
+        }
+      };
       el("preflightButton").onclick = async () => {
         const repoName = el("repoName").value.trim();
         if (!state.selectedId || !repoName) {
           showNotice("请选择项目并填写仓库名。", "error");
           return;
         }
-        setBusy(true, "正在检查敏感文件、Git 历史与仓库冲突…");
+        setBusy(true, "正在检查敏感文件、项目内容与仓库冲突…");
         try {
           const plan = await callTool("preflight_upload", {
             project_id: state.selectedId,
@@ -441,7 +544,8 @@
         }
         if (message.method === "ui/notifications/tool-result") {
           const payload = message.params?.structuredContent;
-          if (payload?.view === "preflight") renderPreflight(payload);
+          if (payload?.view === "self_check") renderSelfCheck(payload);
+          else if (payload?.view === "preflight") renderPreflight(payload);
           else if (payload?.view === "complete") renderComplete(payload);
           else if (payload?.projects) renderProjects(payload);
         } else if (message.method === "ui/notifications/tool-cancelled") {
@@ -453,11 +557,15 @@
 
       window.addEventListener("openai:set_globals", (event) => {
         const payload = event.detail?.globals?.toolOutput;
-        if (payload?.projects) renderProjects(payload);
+        if (payload?.view === "self_check") renderSelfCheck(payload);
+        else if (payload?.projects) renderProjects(payload);
       }, { passive: true });
 
       const initial = window.openai?.toolOutput;
-      if (initial?.projects) {
+      if (initial?.view === "self_check") {
+        renderSelfCheck(initial);
+        showNotice("");
+      } else if (initial?.projects) {
         renderProjects(initial);
         showNotice("");
       } else {
@@ -466,7 +574,7 @@
 
       async function connectMcpApp() {
         const initialized = await request("ui/initialize", {
-          appInfo: { name: "github-project-uploader", version: "0.1.0" },
+          appInfo: { name: "github-project-uploader", version: "0.3.0" },
           appCapabilities: { availableDisplayModes: ["inline"] },
           protocolVersion: "2026-01-26",
         });
