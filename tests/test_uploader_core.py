@@ -59,6 +59,22 @@ class UploaderCoreTests(unittest.TestCase):
         ):
             return core.preflight_upload(project_id, repo_name)
 
+    def committed_standard_project(self, *, with_origin: bool) -> dict:
+        git = core._git_executable()
+        subprocess.run([git, "-C", str(self.project), "init", "-b", "main"], check=True, capture_output=True)
+        subprocess.run([git, "-C", str(self.project), "config", "user.name", "Test"], check=True)
+        subprocess.run([git, "-C", str(self.project), "config", "user.email", "test@example.invalid"], check=True)
+        (self.project / "README.md").write_text("safe\n", encoding="utf-8")
+        subprocess.run([git, "-C", str(self.project), "add", "README.md"], check=True)
+        subprocess.run([git, "-C", str(self.project), "commit", "-m", "safe"], check=True, capture_output=True)
+        if with_origin:
+            subprocess.run(
+                [git, "-C", str(self.project), "remote", "add", "origin", "git@github.com:ExampleUser/safe-project.git"],
+                check=True,
+                capture_output=True,
+            )
+        return self.register()
+
     def test_register_is_idempotent_and_state_is_private(self) -> None:
         first = core.register_project(str(self.project))
         second = core.register_project(str(self.project))
@@ -95,6 +111,94 @@ class UploaderCoreTests(unittest.TestCase):
         project = self.register()
         result = core.self_check_project(project["id"])
         self.assertTrue(any(issue["code"] == "current_assigned_secret" for issue in result["credential_findings"]))
+        self.assertNotIn(secret, json.dumps(result, ensure_ascii=False))
+
+    def test_self_check_scans_symlink_target_as_git_content(self) -> None:
+        (self.project / ".gitignore").write_text("\n", encoding="utf-8")
+        secret = "sk-" + "proj-" + "A" * 30
+        (self.project / "config-link").symlink_to(secret)
+        project = self.register()
+        result = core.self_check_project(project["id"])
+        self.assertTrue(
+            any(
+                issue["code"] == "current_openai_api_key" and issue.get("path") == "config-link"
+                for issue in result["credential_findings"]
+            )
+        )
+        self.assertNotIn(secret, json.dumps(result, ensure_ascii=False))
+
+    def test_self_check_detects_sensitive_symlink_filename(self) -> None:
+        (self.project / ".gitignore").write_text("\n", encoding="utf-8")
+        (self.project / ".env").symlink_to("local-config")
+        project = self.register()
+        result = core.self_check_project(project["id"])
+        self.assertTrue(
+            any(
+                issue["code"] == "environment_file" and issue.get("path") == ".env"
+                for issue in result["credential_findings"]
+            )
+        )
+
+    def test_self_check_scans_committed_symlink_target(self) -> None:
+        subprocess.run([core._git_executable(), "-C", str(self.project), "init", "-b", "main"], check=True, capture_output=True)
+        subprocess.run([core._git_executable(), "-C", str(self.project), "config", "user.name", "Test"], check=True)
+        subprocess.run([core._git_executable(), "-C", str(self.project), "config", "user.email", "test@example.invalid"], check=True)
+        secret = "sk-" + "proj-" + "B" * 30
+        (self.project / "config-link").symlink_to(secret)
+        subprocess.run([core._git_executable(), "-C", str(self.project), "add", "config-link"], check=True)
+        subprocess.run([core._git_executable(), "-C", str(self.project), "commit", "-m", "link"], check=True, capture_output=True)
+        project = self.register()
+        result = core.self_check_project(project["id"])
+        self.assertTrue(any(issue["code"] == "current_openai_api_key" for issue in result["credential_findings"]))
+        self.assertNotIn(secret, json.dumps(result, ensure_ascii=False))
+
+    def test_self_check_detects_utf16_credentials_with_and_without_bom(self) -> None:
+        (self.project / ".gitignore").write_text("\n", encoding="utf-8")
+        secret = "synthetic" + "ConfigValue" * 3
+        content = "safe=1\nAPI_" + "KEY=" + secret + "\n"
+        encodings = {
+            "le_bom": content.encode("utf-16"),
+            "be_bom": b"\xfe\xff" + content.encode("utf-16-be"),
+            "le_plain": content.encode("utf-16-le"),
+            "be_plain": content.encode("utf-16-be"),
+        }
+        for name, data in encodings.items():
+            (self.project / f"config-{name}.txt").write_bytes(data)
+        project = self.register()
+        result = core.self_check_project(project["id"])
+        findings = result["credential_findings"]
+        for name in encodings:
+            with self.subTest(name=name):
+                self.assertTrue(
+                    any(
+                        issue["code"] == "current_assigned_secret"
+                        and issue.get("path") == f"config-{name}.txt"
+                        and issue.get("line") == 2
+                        for issue in findings
+                    )
+                )
+        self.assertNotIn(secret, json.dumps(result, ensure_ascii=False))
+
+    def test_self_check_detects_utf16_credential_in_git_history(self) -> None:
+        subprocess.run([core._git_executable(), "-C", str(self.project), "init", "-b", "main"], check=True, capture_output=True)
+        subprocess.run([core._git_executable(), "-C", str(self.project), "config", "user.name", "Test"], check=True)
+        subprocess.run([core._git_executable(), "-C", str(self.project), "config", "user.email", "test@example.invalid"], check=True)
+        secret = "synthetic" + "HistoryValue" * 3
+        candidate = self.project / "config.txt"
+        candidate.write_bytes(("safe=1\nAPI_" + "KEY=" + secret + "\n").encode("utf-16"))
+        subprocess.run([core._git_executable(), "-C", str(self.project), "add", "config.txt"], check=True)
+        subprocess.run([core._git_executable(), "-C", str(self.project), "commit", "-m", "fixture"], check=True, capture_output=True)
+        candidate.write_text("safe\n", encoding="utf-8")
+        subprocess.run([core._git_executable(), "-C", str(self.project), "add", "config.txt"], check=True)
+        subprocess.run([core._git_executable(), "-C", str(self.project), "commit", "-m", "clean fixture"], check=True, capture_output=True)
+        project = self.register()
+        result = core.self_check_project(project["id"])
+        self.assertTrue(
+            any(
+                issue["code"] == "history_assigned_secret" and issue.get("line") == 2
+                for issue in result["credential_findings"]
+            )
+        )
         self.assertNotIn(secret, json.dumps(result, ensure_ascii=False))
 
     def test_self_check_finds_deleted_secret_in_git_history(self) -> None:
@@ -340,6 +444,165 @@ class UploaderCoreTests(unittest.TestCase):
         result = self.preflight(project["id"])
         self.assertFalse(result["ready"])
         self.assertIn("push_url_conflict", {issue["code"] for issue in result["issues"]})
+
+    def test_standard_upload_rejects_replaced_repository_identity_before_push(self) -> None:
+        project = self.committed_standard_project(with_origin=True)
+        head = core._head(self.project)
+        self.assertIsNotNone(head)
+        target = {
+            "nameWithOwner": "ExampleUser/safe-project",
+            "visibility": "private",
+            "url": "https://github.com/ExampleUser/safe-project",
+            "id": 101,
+        }
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ), mock.patch.object(core, "_isolated_remote_branch_oid", return_value=head), mock.patch.object(
+            core, "_remote_branch_oid", return_value=head
+        ), mock.patch.object(core, "_git_push_command", side_effect=AssertionError("unexpected push")) as push:
+            plan = core.preflight_upload(project["id"], "safe-project")
+            self.assertTrue(plan["ready"])
+            self.assertEqual(core._read_plan(plan["plan_id"])["target_repository_id"], 101)
+            target["id"] = 202
+            with self.assertRaises(core.UploadError):
+                core.execute_upload(plan["plan_id"])
+            push.assert_not_called()
+
+    def test_standard_upload_rejects_create_response_identity_mismatch_before_push(self) -> None:
+        project = self.committed_standard_project(with_origin=False)
+        created_target = {
+            "nameWithOwner": "ExampleUser/safe-project",
+            "visibility": "private",
+            "url": "https://github.com/ExampleUser/safe-project",
+            "id": 101,
+        }
+        replacement_target = {**created_target, "id": 202}
+        lookups = 0
+
+        def repo_view_after_create(*_args: object) -> dict | None:
+            nonlocal lookups
+            lookups += 1
+            return None if lookups == 1 else replacement_target
+
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=None
+        ), mock.patch.object(core, "_isolated_remote_branch_oid", return_value=None), mock.patch.object(
+            core, "_remote_branch_oid", return_value=None
+        ):
+            plan = core.preflight_upload(project["id"], "safe-project")
+        self.assertTrue(plan["ready"])
+        self.assertIsNone(core._read_plan(plan["plan_id"])["target_repository_id"])
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", side_effect=repo_view_after_create
+        ), mock.patch.object(core, "_create_repository", return_value=created_target) as create, mock.patch.object(
+            core, "_isolated_remote_branch_oid", return_value=None
+        ), mock.patch.object(core, "_remote_branch_oid", return_value=None), mock.patch.object(
+            core, "_git_push_command", side_effect=AssertionError("unexpected push")
+        ) as push:
+            with self.assertRaises(core.UploadError):
+                core.execute_upload(plan["plan_id"])
+            create.assert_called_once()
+            push.assert_not_called()
+
+    def test_standard_upload_rejects_remote_branch_changed_since_preflight(self) -> None:
+        project = self.committed_standard_project(with_origin=True)
+        head = core._head(self.project)
+        self.assertIsNotNone(head)
+        target = {
+            "nameWithOwner": "ExampleUser/safe-project",
+            "visibility": "private",
+            "url": "https://github.com/ExampleUser/safe-project",
+            "id": 101,
+        }
+        remote = {"oid": head}
+
+        def remote_oid(*_args: object) -> str:
+            return remote["oid"]
+
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ), mock.patch.object(core, "_isolated_remote_branch_oid", side_effect=remote_oid), mock.patch.object(
+            core, "_remote_branch_oid", side_effect=remote_oid
+        ), mock.patch.object(core, "_git_push_command", side_effect=AssertionError("unexpected push")) as push:
+            plan = core.preflight_upload(project["id"], "safe-project")
+            self.assertTrue(plan["ready"])
+            self.assertEqual(core._read_plan(plan["plan_id"])["base_oid"], head)
+            remote["oid"] = "b" * 40
+            with self.assertRaises(core.UploadError):
+                core.execute_upload(plan["plan_id"])
+            push.assert_not_called()
+
+    def test_standard_upload_rejects_remote_branch_changed_just_before_push(self) -> None:
+        project = self.committed_standard_project(with_origin=True)
+        head = core._head(self.project)
+        self.assertIsNotNone(head)
+        target = {
+            "nameWithOwner": "ExampleUser/safe-project",
+            "visibility": "private",
+            "url": "https://github.com/ExampleUser/safe-project",
+            "id": 101,
+        }
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ), mock.patch.object(core, "_isolated_remote_branch_oid", return_value=head):
+            plan = core.preflight_upload(project["id"], "safe-project")
+        self.assertTrue(plan["ready"])
+        oid_checks = 0
+
+        def remote_oid_during_execute(*_args: object) -> str:
+            nonlocal oid_checks
+            oid_checks += 1
+            return head if oid_checks == 1 else "b" * 40
+
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ), mock.patch.object(core, "_isolated_remote_branch_oid", side_effect=remote_oid_during_execute), mock.patch.object(
+            core, "_remote_branch_oid", return_value=head
+        ), mock.patch.object(core, "_create_repository", side_effect=AssertionError("unexpected create")), mock.patch.object(
+            core, "_git_push_command", side_effect=AssertionError("unexpected push")
+        ) as push:
+            with self.assertRaisesRegex(core.UploadError, "推送前|确认后"):
+                core.execute_upload(plan["plan_id"])
+            self.assertEqual(oid_checks, 2)
+            push.assert_not_called()
+
+    def test_standard_upload_does_not_report_success_if_repository_id_changes_after_push(self) -> None:
+        project = self.committed_standard_project(with_origin=True)
+        head = core._head(self.project)
+        self.assertIsNotNone(head)
+        target = {
+            "nameWithOwner": "ExampleUser/safe-project",
+            "visibility": "private",
+            "url": "https://github.com/ExampleUser/safe-project",
+            "id": 101,
+        }
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", return_value=target
+        ), mock.patch.object(core, "_isolated_remote_branch_oid", return_value=head):
+            plan = core.preflight_upload(project["id"], "safe-project")
+        self.assertTrue(plan["ready"])
+        original_run_command = core.run_command
+        pushes: list[list[str]] = []
+
+        def fake_push(args: list[str], **kwargs: object) -> core.CommandResult:
+            if "push" in args:
+                pushes.append(args)
+                return core.CommandResult(0, "", "")
+            return original_run_command(args, **kwargs)
+
+        replaced_target = {**target, "id": 202}
+        with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
+            core, "_repo_view", side_effect=[target, target, target, replaced_target]
+        ), mock.patch.object(core, "_isolated_remote_branch_oid", return_value=head), mock.patch.object(
+            core, "_remote_branch_oid", return_value=head
+        ), mock.patch.object(core, "_create_repository", side_effect=AssertionError("unexpected create")), mock.patch.object(
+            core, "run_command", side_effect=fake_push
+        ):
+            with self.assertRaisesRegex(core.UploadError, "推送后无法确认"):
+                core.execute_upload(plan["plan_id"])
+        self.assertEqual(len(pushes), 1)
+        registered = next(entry for entry in core._load_registry()["projects"] if entry["id"] == project["id"])
+        self.assertNotIn("last_upload_url", registered)
 
     def test_nested_repository_blocks_new_project(self) -> None:
         nested = self.project / "nested"
@@ -1324,6 +1587,7 @@ class UploaderCoreTests(unittest.TestCase):
             "nameWithOwner": "ExampleUser/safe-project",
             "visibility": "private",
             "url": "https://github.com/ExampleUser/safe-project",
+            "id": 12345,
         }
         original = core.run_command
         pushes: list[tuple[list[str], dict[str, object]]] = []
@@ -1338,8 +1602,10 @@ class UploaderCoreTests(unittest.TestCase):
             return original(args, **kwargs)
 
         with mock.patch.object(core, "github_owner", return_value="ExampleUser"), mock.patch.object(
-            core, "_repo_view", side_effect=[None, target]
-        ), mock.patch.object(core, "_gh_executable", return_value="/usr/bin/true"), mock.patch.object(
+            core, "_repo_view", side_effect=[None, target, target, target]
+        ), mock.patch.object(core, "_create_repository", return_value=target), mock.patch.object(
+            core, "_isolated_remote_branch_oid", return_value=None
+        ), mock.patch.object(
             core, "run_command", side_effect=capture_push
         ):
             result = core.execute_upload(plan["plan_id"])
@@ -1420,6 +1686,7 @@ class UploaderCoreTests(unittest.TestCase):
             "nameWithOwner": "ExampleUser/safe-project",
             "visibility": "private",
             "url": "https://github.com/ExampleUser/safe-project",
+            "id": 12345,
         }
         original = core.run_command
         pushes: list[list[str]] = []
@@ -1435,8 +1702,9 @@ class UploaderCoreTests(unittest.TestCase):
 
         with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_config)}), mock.patch.object(
             core, "github_owner", return_value="ExampleUser"
-        ), mock.patch.object(core, "_repo_view", side_effect=[None, target]), mock.patch.object(
-            core, "_gh_executable", return_value="/usr/bin/true"
+        ), mock.patch.object(core, "_repo_view", side_effect=[None, target, target, target]), mock.patch.object(
+            core, "_create_repository", return_value=target
+        ), mock.patch.object(core, "_isolated_remote_branch_oid", return_value=None
         ), mock.patch.object(core, "run_command", side_effect=fake_network):
             result = core.execute_upload(plan["plan_id"])
         self.assertTrue(result["uploaded"])

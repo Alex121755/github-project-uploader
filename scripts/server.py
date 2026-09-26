@@ -21,7 +21,7 @@ import uploader_core  # noqa: E402
 
 SERVER_NAME = "github-project-uploader"
 SERVER_TITLE = "GitHub 项目上传器"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.3.1"
 SERVER_DESCRIPTION = "选择本地项目，独立自检疑似凭据泄漏，安全预检后上传到当前登录的 GitHub 账号。"
 SERVER_INSTRUCTIONS = (
     "默认私有。选择时只调用 render_upload_picker；指定已注册项目时最多 list_projects 一次；"

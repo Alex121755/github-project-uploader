@@ -21,10 +21,11 @@ The plugin provides:
 - A one-click local credential self-check for selected files and reachable Git history, with no GitHub sign-in or repository name required.
 - A local registry for adding exact project directories, including non-repository subdirectories isolated from larger Git repositories.
 - A ten-minute, one-time preflight plan before every upload.
-- Heuristic secret scanning across selected files and bounded Git history.
+- Heuristic secret scanning across selected files (including symlink targets and common UTF-16 configuration text) and bounded Git history.
 - Checks for Git state, hidden index flags, remote conflicts, oversized content, nested repositories inside the selection, shallow/partial clones, and Git LFS.
 - An isolated-subdirectory mode that neither inherits nor modifies the parent repository's history, index, configuration, remotes, or ignore rules.
 - An isolated push of one exact commit, followed by verification of the remote branch object ID.
+- Standard Git uploads bind each preflight to the exact GitHub repository ID and target-branch OID, with checks again before push and an identity check afterward.
 - Private repositories by default and a separate exact-name confirmation for public repositories.
 
 ## What it deliberately does not do

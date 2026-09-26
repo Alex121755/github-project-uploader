@@ -2,6 +2,13 @@
 
 All notable changes are documented here. The project follows semantic versioning before the Codex development cache suffix.
 
+## 0.3.1 - 2026-09-26
+
+- Bind standard Git uploads to the exact GitHub repository ID and remote branch OID reviewed at preflight; recheck them before push and verify repository identity afterward.
+- Capture the immutable repository ID from GitHub's creation response in standard mode as well as isolated-subdirectory mode.
+- Scan Git symlink target text and UTF-16 configuration content (with a BOM or a strong NUL-byte pattern) for credentials; malformed BOM-marked UTF-16 blocks upload.
+- Add regression tests for repository replacement, remote drift, symlink target secrets, and UTF-16 current/history findings.
+
 ## 0.3.0 - 2026-09-26
 
 - Added a one-click, local credential self-check for selected projects, independent of GitHub authentication and upload plans.

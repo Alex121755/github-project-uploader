@@ -1580,10 +1580,51 @@ def _is_credential_issue(issue: dict[str, Any]) -> bool:
     return any(code == rule or code.endswith(f"_{rule}") for rule in CREDENTIAL_ISSUE_RULES)
 
 
+def _text_variants_for_scan(data: bytes) -> tuple[list[str], bool]:
+    variants = [data.decode("utf-8", errors="ignore")]
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            variants.append(data.decode("utf-16"))
+        except UnicodeDecodeError:
+            return variants, True
+        return variants, False
+    if b"\x00" not in data:
+        return variants, False
+
+    # Common UTF-16 configuration files have no BOM. Require a strong NUL
+    # parity signal in one window before interpreting arbitrary bytes as text.
+    encoding: str | None = None
+    for offset in range(0, len(data), 4096):
+        window = data[offset : offset + 4096]
+        even, odd = window[0::2], window[1::2]
+        if len(odd) < 16:
+            continue
+        even_nuls = even.count(0) / len(even)
+        odd_nuls = odd.count(0) / len(odd)
+        if odd_nuls >= 0.60 and even_nuls <= 0.10:
+            encoding = "utf-16-le"
+            break
+        if even_nuls >= 0.60 and odd_nuls <= 0.10:
+            encoding = "utf-16-be"
+            break
+    if encoding:
+        variants.append(data.decode(encoding, errors="replace"))
+    return variants, False
+
+
 def _scan_bytes(data: bytes, relative: str, source: str) -> list[dict[str, Any]]:
-    text = data.decode("utf-8", errors="ignore")
+    variants, decode_failed = _text_variants_for_scan(data)
     issues: list[dict[str, Any]] = []
-    if re.search(r"(?m)^version https://git-lfs\.github\.com/spec/v1\r?$", text):
+    if decode_failed:
+        issues.append(
+            _issue(
+                "block",
+                f"{source}_text_decode_failed",
+                "UTF-16 文件无法完整解码，不能可靠检查敏感信息。",
+                relative,
+            )
+        )
+    if any(re.search(r"(?m)^version https://git-lfs\.github\.com/spec/v1\r?$", text) for text in variants):
         issues.append(
             _issue(
                 "block",
@@ -1593,19 +1634,24 @@ def _scan_bytes(data: bytes, relative: str, source: str) -> list[dict[str, Any]]
             )
         )
     for code, pattern in SECRET_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            line = text.count("\n", 0, match.start()) + 1
-            issues.append(
-                _issue(
-                    "block",
-                    f"{source}_{code}",
-                    "检测到可能的敏感凭据；不会显示其内容。请移除、轮换或加入忽略规则后重试。",
-                    relative,
-                    line,
+        for text in variants:
+            match = pattern.search(text)
+            if match:
+                line = text.count("\n", 0, match.start()) + 1
+                issues.append(
+                    _issue(
+                        "block",
+                        f"{source}_{code}",
+                        "检测到可能的敏感凭据；不会显示其内容。请移除、轮换或加入忽略规则后重试。",
+                        relative,
+                        line,
+                    )
                 )
-            )
-    if '"type"' in text and SERVICE_ACCOUNT_TYPE_MARKER in text and PRIVATE_KEY_FIELD_MARKER in text:
+                break
+    if any(
+        '"type"' in text and SERVICE_ACCOUNT_TYPE_MARKER in text and PRIVATE_KEY_FIELD_MARKER in text
+        for text in variants
+    ):
         issues.append(
             _issue(
                 "block",
@@ -1921,6 +1967,26 @@ def _snapshot(
         except OSError:
             issues.append(_issue("block", "unreadable_file", "文件在预检时无法读取。", relative))
             continue
+        path_rule = _path_secret_rule(relative)
+        if path_rule:
+            issues.append(
+                _issue(
+                    "block",
+                    path_rule,
+                    "文件名表明它可能包含凭据；请移除或确保它被 Git 忽略。",
+                    relative,
+                )
+            )
+        embedded_path_rule = _embedded_secret_rule(relative)
+        if embedded_path_rule:
+            issues.append(
+                _issue(
+                    "block",
+                    f"current_path_{embedded_path_rule}",
+                    "文件名本身包含疑似敏感凭据；路径已脱敏，请重命名并轮换凭据后重试。",
+                    relative,
+                )
+            )
         if stat.S_ISLNK(info.st_mode):
             try:
                 link_target = os.readlink(candidate)
@@ -1928,7 +1994,15 @@ def _snapshot(
                 issues.append(_issue("block", "unreadable_file", "符号链接在预检时无法读取。", relative))
                 continue
             git_mode = "120000"
-            digest.update(f"L\0{relative}\0{git_mode}\0{link_target}\n".encode())
+            link_bytes = os.fsencode(link_target)
+            total_bytes += len(link_bytes)
+            digest.update(b"L\0" + os.fsencode(relative) + b"\0" + git_mode.encode() + b"\0" + link_bytes + b"\n")
+            if include_security_scan and current_scanned < MAX_CURRENT_SCAN_BYTES:
+                # Git stores the link target as the blob content, so it must be
+                # scanned just like a regular file before publication.
+                read_size = min(len(link_bytes), MAX_CURRENT_SCAN_BYTES - current_scanned)
+                current_scanned += read_size
+                issues.extend(_scan_bytes(link_bytes[:read_size], relative, "current"))
             if relative in index_modes and index_modes[relative] != git_mode:
                 issues.append(
                     _issue(
@@ -1951,26 +2025,6 @@ def _snapshot(
                     "block",
                     "git_mode_mismatch",
                     "当前文件类型或可执行位与 Git 索引不一致；请更新索引后重试。",
-                    relative,
-                )
-            )
-        path_rule = _path_secret_rule(relative)
-        if path_rule:
-            issues.append(
-                _issue(
-                    "block",
-                    path_rule,
-                    "文件名表明它可能包含凭据；请移除或确保它被 Git 忽略。",
-                    relative,
-                )
-            )
-        embedded_path_rule = _embedded_secret_rule(relative)
-        if embedded_path_rule:
-            issues.append(
-                _issue(
-                    "block",
-                    f"current_path_{embedded_path_rule}",
-                    "文件名本身包含疑似敏感凭据；路径已脱敏，请重命名并轮换凭据后重试。",
                     relative,
                 )
             )
@@ -2531,6 +2585,15 @@ def preflight_upload(project_id: str, repo_name: str, visibility: str = "private
                 f"现有仓库实际为 {actual_visibility}，与本次计划的 {visibility} 不一致；请按实际可见性重新预检。",
             )
         )
+    target_repository_id = target.get("id") if target else None
+    if target is not None and (type(target_repository_id) is not int or target_repository_id <= 0):
+        issues.append(_issue("block", "unknown_repository_identity", "无法确认现有 GitHub 仓库的固定身份。"))
+    if not isolated and target is not None and snapshot["branch"] and not any(
+        issue["severity"] == "block" for issue in issues
+    ):
+        base_oid = _isolated_remote_branch_oid(
+            f"git@github.com:{target_slug}.git", str(snapshot["branch"])
+        )
     if visibility == "public":
         issues.append(_issue("warn", "public_repository", "这是公开仓库；任何人都能看到上传内容。"))
 
@@ -2545,6 +2608,7 @@ def preflight_upload(project_id: str, repo_name: str, visibility: str = "private
         "owner": owner,
         "repo_name": repo,
         "target": target_slug,
+        "target_repository_id": target_repository_id,
         "visibility": visibility,
         "upload_mode": upload_mode,
         "isolated_binding_fingerprint": _isolated_binding_fingerprint(binding),
@@ -2825,6 +2889,22 @@ def _execute_upload_locked(plan_id: str, confirm_public_repository: str = "") ->
             raise UploadError(remote_issues[0]["message"])
         if target is not None and origin_slug != target_slug.lower():
             raise UploadError("目标仓库已存在但未与本地 origin 绑定；请重新确认仓库。")
+        expected_repository_id = plan.get("target_repository_id")
+        if expected_repository_id is None:
+            if target is not None:
+                raise UploadError("GitHub 目标仓库在预检后出现；请重新预检，不能接管同名仓库。")
+        elif (
+            type(expected_repository_id) is not int
+            or expected_repository_id <= 0
+            or target is None
+            or target.get("id") != expected_repository_id
+        ):
+            raise UploadError("同名 GitHub 仓库的固定身份在预检后发生变化；未执行推送。")
+        if target is not None:
+            safe_push_url = f"git@github.com:{target_slug}.git"
+            remote_base_oid = _isolated_remote_branch_oid(safe_push_url, str(current["branch"]))
+            if remote_base_oid != plan.get("base_oid"):
+                raise UploadError("GitHub 目标分支在预检后发生变化；请重新预检。")
     if target is not None and str(target.get("visibility", "")).lower() != plan.get("visibility"):
         raise UploadError("目标仓库的实际可见性与预检计划不一致；请重新预检。")
 
@@ -2840,7 +2920,6 @@ def _execute_upload_locked(plan_id: str, confirm_public_repository: str = "") ->
     if isolated:
         return _execute_isolated_upload(plan, item, path, target)
 
-    gh = _gh_executable()
     if not current["is_git_repository"]:
         initialized = run_command(
             _git_command(path, "init", "--template=", "-b", "main"),
@@ -2914,9 +2993,9 @@ def _execute_upload_locked(plan_id: str, confirm_public_repository: str = "") ->
 
     current_origin = _origin(path)
     current_origin_slug = _github_slug_from_remote(current_origin or "")
-    visibility_flag = "--private" if plan.get("visibility") == "private" else "--public"
     safe_push_url = f"git@github.com:{owner}/{repo}.git"
     created = False
+    repository_id = plan.get("target_repository_id")
     if target is None:
         if current_origin is not None and current_origin_slug != target_slug.lower():
             raise UploadError("创建仓库前检测到 origin 变化；操作已停止。")
@@ -2926,7 +3005,8 @@ def _execute_upload_locked(plan_id: str, confirm_public_repository: str = "") ->
             current_origin_slug = _github_slug_from_remote(current_origin or "")
             if current_origin_slug != target_slug.lower():
                 raise UploadError("无法确认刚添加的 origin；未创建 GitHub 仓库。")
-        run_command([gh, "repo", "create", target_slug, visibility_flag], timeout=180)
+        created_target = _create_repository(owner, repo, str(plan["visibility"]))
+        repository_id = created_target["id"]
         created = True
     elif current_origin_slug != target_slug.lower():
         raise UploadError("目标仓库已存在但 origin 不匹配；操作已停止。")
@@ -2942,9 +3022,21 @@ def _execute_upload_locked(plan_id: str, confirm_public_repository: str = "") ->
         raise UploadError("无法确认 GitHub 目标仓库；未执行推送。")
     if str(verified_target.get("visibility", "")).lower() != plan.get("visibility"):
         raise UploadError("目标仓库的实际可见性已变化；未执行推送。")
+    if type(repository_id) is not int or repository_id <= 0 or verified_target.get("id") != repository_id:
+        raise UploadError("同名 GitHub 仓库的固定身份在推送前发生变化；未执行推送。")
 
     if _head(path) != push_oid:
         raise UploadError("本地 HEAD 已变化；为避免上传未确认提交，操作已停止。")
+    remote_before_push = _isolated_remote_branch_oid(safe_push_url, validated_branch)
+    if remote_before_push != plan.get("base_oid"):
+        raise UploadError("GitHub 目标分支在确认后发生变化；未执行推送。")
+    target_immediately_before_push = _repo_view(owner, repo)
+    if (
+        target_immediately_before_push is None
+        or target_immediately_before_push.get("id") != repository_id
+        or str(target_immediately_before_push.get("visibility", "")).lower() != plan.get("visibility")
+    ):
+        raise UploadError("同名 GitHub 仓库的固定身份或可见性在推送前发生变化；未执行推送。")
     with _isolated_push_repository(path, push_oid) as (transport_root, transport_git_dir, transport_env):
         run_command(
             _git_push_command(transport_git_dir, safe_push_url, push_oid, validated_branch),
@@ -2953,7 +3045,14 @@ def _execute_upload_locked(plan_id: str, confirm_public_repository: str = "") ->
         )
         _verify_remote_branch(transport_root, safe_push_url, push_oid, validated_branch)
 
-    url = verified_target["url"]
+    target_after_push = _repo_view(owner, repo)
+    if (
+        target_after_push is None
+        or target_after_push.get("id") != repository_id
+        or str(target_after_push.get("visibility", "")).lower() != plan.get("visibility")
+    ):
+        raise UploadError("推送后无法确认目标仍是原 GitHub 仓库；不会报告成功，请人工核对同名仓库。")
+    url = target_after_push["url"]
     with _state_lock():
         registry = _load_registry()
         for entry in registry["projects"]:
