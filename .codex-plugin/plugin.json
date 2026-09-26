@@ -1,6 +1,6 @@
 {
   "name": "github-project-uploader",
-  "version": "0.3.1+codex.20260926040945",
+  "version": "0.3.2+codex.20260926051749",
   "description": "Choose a local project, self-check for exposed credentials, then preflight and upload an exact commit to GitHub after confirmation.",
   "author": {
     "name": "ALEX",

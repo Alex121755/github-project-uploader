@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -16,6 +17,43 @@ import server  # noqa: E402
 
 
 class ServerContractTests(unittest.TestCase):
+    def test_preflight_rejects_missing_plugin_root_from_unrelated_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            unrelated = Path(temporary) / "unrelated-task"
+            unrelated.mkdir()
+            missing_plugin_root = Path(temporary) / "missing-plugin"
+            original_cwd = Path.cwd()
+            try:
+                os.chdir(unrelated)
+                with mock.patch.object(server, "PLUGIN_ROOT", missing_plugin_root), mock.patch.object(
+                    server.uploader_core, "preflight_upload"
+                ) as preflight:
+                    result = server._call_tool(
+                        "preflight_upload",
+                        {"project_id": "p1", "repo_name": "example", "visibility": "private"},
+                    )
+            finally:
+                os.chdir(original_cwd)
+        self.assertTrue(result["isError"])
+        self.assertFalse(result["structuredContent"]["ok"])
+        preflight.assert_not_called()
+
+    def test_preflight_rejects_existing_plugin_root_from_unrelated_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            original_cwd = Path.cwd()
+            try:
+                os.chdir(temporary)
+                with mock.patch.object(server.uploader_core, "preflight_upload") as preflight:
+                    result = server._call_tool(
+                        "preflight_upload",
+                        {"project_id": "p1", "repo_name": "example", "visibility": "private"},
+                    )
+            finally:
+                os.chdir(original_cwd)
+        self.assertTrue(result["isError"])
+        self.assertFalse(result["structuredContent"]["ok"])
+        preflight.assert_not_called()
+
     def test_tool_text_summaries_do_not_duplicate_structured_payloads(self) -> None:
         listed_payload = {
             "projects": [{"id": "p1", "name": "Example", "path": "/private/example"}],

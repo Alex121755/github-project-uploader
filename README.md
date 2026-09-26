@@ -159,6 +159,7 @@ State files use owner-only permissions and may contain project paths, upload mod
 ## Troubleshooting
 
 - **No picker card:** continue in conversation; the plugin can list projects and complete the same confirmation flow without UI.
+- **Plugin working directory invalid after an update:** the previous MCP process may still point to a deleted versioned cache directory. Start a new Codex task or restart Codex, then run a fresh preflight; do not reuse the old plan.
 - **GitHub account unavailable:** run `gh auth status`, then authenticate again with `gh auth login`.
 - **SSH fails:** verify direct access with the SSH test command above. Custom `~/.ssh/config` settings are intentionally ignored.
 - **Dirty repository:** commit, stash, or discard the changes yourself, then run a new preflight.

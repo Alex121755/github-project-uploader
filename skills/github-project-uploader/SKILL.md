@@ -21,6 +21,7 @@ Use the plugin tools. For upload-only work, skip source inspection, web browsing
 ## Boundaries
 
 - Plans are one-use and short-lived. Expiry or any project/account/target/visibility/finding change requires a new preflight and confirmation.
+- If a tool reports an invalid plugin working directory or stale runtime after an update, stop. Start a new Codex task or restart Codex and then run a fresh preflight; never execute a plan from the stale process.
 - Never expose matched secret values; show only returned rule, path, and line.
 - A self-check with zero matches is a heuristic result, not proof that no credential exists. Upload still requires a fresh preflight and its confirmation.
 - Never bypass blockers, modify files merely to silence them, replace `origin`, force/mirror-push, rewrite history, delete remotes, or claim Git LFS support.

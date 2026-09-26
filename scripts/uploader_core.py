@@ -37,6 +37,7 @@ ISOLATED_SUBDIRECTORY_BRANCH = "main"
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+SAFE_SUBPROCESS_CWD = Path("/")
 STATE_DIR = CODEX_HOME / "github-project-uploader"
 REGISTRY_PATH = STATE_DIR / "projects.json"
 PLANS_PATH = STATE_DIR / "plans.json"
@@ -59,6 +60,11 @@ SAFE_PUSH_ENV = {
 
 class UploadError(RuntimeError):
     pass
+
+
+def _require_absolute_codex_home() -> None:
+    if not CODEX_HOME.is_absolute():
+        raise UploadError("CODEX_HOME 必须是绝对路径；插件无法安全读取项目列表或上传计划。")
 
 
 @dataclass(frozen=True)
@@ -173,7 +179,9 @@ def run_command(
         raise UploadError("安全策略禁止强制推送或镜像推送。")
     completed = subprocess.run(
         args,
-        cwd=str(cwd) if cwd else None,
+        # A plugin update can delete an older server's cwd while the process is
+        # still alive. Never let Git or gh inherit that stale directory.
+        cwd=str(cwd) if cwd is not None else str(SAFE_SUBPROCESS_CWD),
         input=input_text,
         text=True,
         stdout=subprocess.PIPE,
@@ -195,6 +203,7 @@ def _run_bounded_stdout(args: list[str], *, max_bytes: int, timeout: int) -> str
         raise UploadError("内部有界命令参数无效。")
     process = subprocess.Popen(
         args,
+        cwd=str(SAFE_SUBPROCESS_CWD),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -254,7 +263,8 @@ def _git_executable() -> str:
     system_git = Path("/usr/bin/git")
     if system_git.is_file() and os.access(system_git, os.X_OK):
         return str(system_git)
-    return shutil.which("git") or "/usr/bin/git"
+    found = shutil.which("git")
+    return str(Path(found).resolve()) if found else "/usr/bin/git"
 
 
 def _git_command(path: Path, *args: str) -> list[str]:
@@ -695,11 +705,12 @@ def _gh_executable() -> str:
     ]
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
-            return candidate
+            return str(Path(candidate).resolve())
     raise UploadError("未找到 GitHub CLI（gh）。请先在 Codex 中完成 GitHub 登录设置。")
 
 
 def _ensure_state_dir() -> None:
+    _require_absolute_codex_home()
     STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         os.chmod(STATE_DIR, 0o700)
@@ -742,6 +753,7 @@ def _project_execution_lock(project_id: str):
 
 
 def _read_json(path: Path, default: Any) -> Any:
+    _require_absolute_codex_home()
     if not path.exists():
         return default
     try:
@@ -788,6 +800,7 @@ def _load_plans() -> dict[str, Any]:
 
 
 def _validate_project_path(raw_path: str) -> Path:
+    _require_absolute_codex_home()
     if not raw_path.strip():
         raise UploadError("请提供项目目录路径。")
     expanded = Path(raw_path).expanduser()
@@ -1051,7 +1064,7 @@ def register_project(path: str, display_name: str = "") -> dict[str, Any]:
     with _state_lock():
         registry = _load_registry()
         for item in registry["projects"]:
-            if Path(item["path"]).resolve() == resolved:
+            if _registered_project_path(item).resolve() == resolved:
                 changed = item.get("upload_mode") != upload_mode
                 if changed and item.get("isolated_remote"):
                     raise UploadError("这个项目已绑定隔离上传仓库，不能自动改变上传模式；请先保留当前目录结构。")
@@ -1074,8 +1087,18 @@ def register_project(path: str, display_name: str = "") -> dict[str, Any]:
     return {"registered": True, "project": _project_summary(item)}
 
 
+def _registered_project_path(item: dict[str, Any]) -> Path:
+    raw_path = item.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise UploadError("项目列表中存在无效目录；请修复项目注册信息。")
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        raise UploadError("项目列表中存在非绝对路径；请修复项目注册信息。")
+    return path
+
+
 def _project_summary(item: dict[str, Any]) -> dict[str, Any]:
-    path = Path(item.get("path", ""))
+    path = _registered_project_path(item)
     exists = path.is_dir()
     if exists and item.get("upload_mode") == UPLOAD_MODE_ISOLATED_SUBDIRECTORY:
         git_root = _ancestor_git_root(path)
@@ -1727,6 +1750,7 @@ def _read_history_object(path: Path, oid: str, object_type: str, expected_size: 
     command = _git_command(path, "cat-file", object_type, oid)
     result = subprocess.run(
         command,
+        cwd=str(SAFE_SUBPROCESS_CWD),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         env=_command_environment(command),

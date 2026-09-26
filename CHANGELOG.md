@@ -2,6 +2,13 @@
 
 All notable changes are documented here. The project follows semantic versioning before the Codex development cache suffix.
 
+## 0.3.2 - 2026-09-26
+
+- Reject tool calls from an outdated or incorrectly launched plugin process whose working directory no longer matches its installed plugin version; require a new Codex task or restart before preflight.
+- Run Git and GitHub CLI subprocesses from a stable absolute directory when no explicit working directory is needed, and normalize discovered executable paths, so a removed plugin cache directory cannot break repository checks or push preparation.
+- Reject relative `CODEX_HOME` and malformed registered project paths instead of resolving them against an unrelated process directory.
+- Add working-directory and state-path regression tests.
+
 ## 0.3.1 - 2026-09-26
 
 - Bind standard Git uploads to the exact GitHub repository ID and remote branch OID reviewed at preflight; recheck them before push and verify repository identity afterward.

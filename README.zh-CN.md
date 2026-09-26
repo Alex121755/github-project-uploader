@@ -122,6 +122,10 @@ $CODEX_HOME/github-project-uploader/
 
 状态文件可能包含项目路径、上传模式、目标仓库固定身份、commit/branch、失败恢复状态及最后成功的 URL，不保存项目文件内容，也不会复制 GitHub token。Token 的保存由 GitHub CLI 和操作系统负责。
 
+## 故障排查
+
+如果插件更新后提示“工作目录已失效或与安装目录不一致”，说明旧 MCP 进程可能仍指向已删除的版本缓存。新建 Codex 任务或重启 Codex，再重新预检；不要复用旧计划。插件会拒绝在错误的运行目录下继续上传。
+
 ## 开发与测试
 
 ```bash

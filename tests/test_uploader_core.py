@@ -75,6 +75,76 @@ class UploaderCoreTests(unittest.TestCase):
             )
         return self.register()
 
+    def test_git_subprocesses_use_stable_cwd_after_process_cwd_is_removed(self) -> None:
+        self.committed_standard_project(with_origin=False)
+        git = core._git_executable()
+        head = subprocess.run(
+            [git, "-C", str(self.project), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        blob = subprocess.run(
+            [git, "-C", str(self.project), "rev-parse", "HEAD:README.md"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        vanished = self.root / "vanished-cwd"
+        vanished.mkdir()
+        original_cwd_fd = os.open(".", os.O_RDONLY)
+        real_run = subprocess.run
+        real_popen = subprocess.Popen
+
+        def assert_stable_cwd(kwargs: dict) -> None:
+            cwd = kwargs.get("cwd")
+            self.assertIsNotNone(cwd, "Git subprocess inherited the deleted process cwd")
+            self.assertTrue(Path(cwd).is_absolute())
+            self.assertTrue(Path(cwd).is_dir())
+
+        def checked_run(*args, **kwargs):
+            assert_stable_cwd(kwargs)
+            return real_run(*args, **kwargs)
+
+        def checked_popen(*args, **kwargs):
+            assert_stable_cwd(kwargs)
+            return real_popen(*args, **kwargs)
+
+        try:
+            os.chdir(vanished)
+            vanished.rmdir()
+            with self.assertRaises(OSError):
+                os.getcwd()
+            with mock.patch.object(core.subprocess, "run", side_effect=checked_run), mock.patch.object(
+                core.subprocess, "Popen", side_effect=checked_popen
+            ):
+                result = core.run_command(core._git_command(self.project, "rev-parse", "--show-toplevel"))
+                self.assertEqual(Path(result.stdout.strip()).resolve(), self.project.resolve())
+
+                revisions = core._run_bounded_stdout(
+                    core._git_command(self.project, "rev-list", "--all"),
+                    max_bytes=4096,
+                    timeout=30,
+                )
+                self.assertIn(head, revisions.splitlines())
+
+                content = core._read_history_object(self.project, blob, "blob", len(b"safe\n"), 1024)
+                self.assertEqual(content, b"safe\n")
+        finally:
+            os.fchdir(original_cwd_fd)
+            os.close(original_cwd_fd)
+
+    def test_discovered_executables_are_absolute_with_relative_path_entries(self) -> None:
+        with mock.patch.object(core.os, "access", return_value=False), mock.patch.object(
+            core.shutil, "which", return_value="local-bin/git"
+        ):
+            self.assertTrue(Path(core._git_executable()).is_absolute())
+
+        with mock.patch.object(
+            core.Path, "is_file", autospec=True, side_effect=lambda path: str(path) == "local-bin/gh"
+        ), mock.patch.object(core.shutil, "which", return_value="local-bin/gh"):
+            self.assertTrue(Path(core._gh_executable()).is_absolute())
+
     def test_register_is_idempotent_and_state_is_private(self) -> None:
         first = core.register_project(str(self.project))
         second = core.register_project(str(self.project))
@@ -82,6 +152,12 @@ class UploaderCoreTests(unittest.TestCase):
         self.assertFalse(second["registered"])
         self.assertEqual(first["project"]["id"], second["project"]["id"])
         self.assertEqual(self.state.joinpath("projects.json").stat().st_mode & 0o777, 0o600)
+
+    def test_rejects_relative_codex_home_before_state_access(self) -> None:
+        with mock.patch.object(core, "CODEX_HOME", Path("relative-codex-home")):
+            with self.assertRaisesRegex(core.UploadError, "绝对路径"):
+                core._ensure_state_dir()
+        self.assertFalse(self.state.exists())
 
     def test_self_check_finds_prefixed_api_key_without_github_or_value_exposure(self) -> None:
         (self.project / ".gitignore").write_text("\n", encoding="utf-8")

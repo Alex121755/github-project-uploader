@@ -21,7 +21,7 @@ import uploader_core  # noqa: E402
 
 SERVER_NAME = "github-project-uploader"
 SERVER_TITLE = "GitHub 项目上传器"
-SERVER_VERSION = "0.3.1"
+SERVER_VERSION = "0.3.2"
 SERVER_DESCRIPTION = "选择本地项目，独立自检疑似凭据泄漏，安全预检后上传到当前登录的 GitHub 账号。"
 SERVER_INSTRUCTIONS = (
     "默认私有。选择时只调用 render_upload_picker；指定已注册项目时最多 list_projects 一次；"
@@ -193,8 +193,34 @@ def _optional_string(arguments: dict[str, Any], name: str, default: str = "") ->
     return value
 
 
+def _assert_runtime_root() -> None:
+    """Reject calls from an orphaned or incorrectly launched plugin process."""
+    error = (
+        "插件工作目录已失效或与安装目录不一致；旧版服务可能仍在运行。"
+        "请新建 Codex 任务或重启 Codex 后重新预检。"
+    )
+    try:
+        root = PLUGIN_ROOT.resolve(strict=True)
+        active_cwd = Path.cwd().resolve(strict=True)
+        core_root = uploader_core.PLUGIN_ROOT.resolve(strict=True)
+        manifest = json.loads((root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        version = manifest["version"].split("+", 1)[0]
+        required = (root / "scripts" / "server.py", root / "scripts" / "uploader_core.py")
+        valid = (
+            root.is_dir()
+            and active_cwd == root == core_root
+            and all(path.is_file() for path in required)
+            and version == SERVER_VERSION
+        )
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        valid = False
+    if not valid:
+        raise uploader_core.UploadError(error)
+
+
 def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     try:
+        _assert_runtime_root()
         if name == "list_projects":
             payload = {"ok": True, **uploader_core.list_projects()}
             auth = payload.get("github", {})
